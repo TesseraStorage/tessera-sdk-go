@@ -1,0 +1,325 @@
+package siastorage
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"testing"
+	"time"
+
+	proto "go.sia.tech/core/rhp/v4"
+	"go.sia.tech/core/types"
+	"go.uber.org/zap/zaptest"
+	"lukechampine.com/frand"
+)
+
+// erroringReader returns err on the read that consumes the last of its data,
+// then io.EOF, which io.Reader allows but io.ReadFull hides.
+type erroringReader struct {
+	data []byte
+	err  error
+}
+
+func (r *erroringReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+// TestUploadReaderError asserts a failing reader is not mistaken for the end
+// of the stream, which would silently truncate the object.
+func TestUploadReaderError(t *testing.T) {
+	const dataShards, parityShards = 3, 9
+
+	sdk, _ := newTestSDK(t, dataShards+parityShards, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	// a truncated stream surfaces io.ErrUnexpectedEOF instead of being
+	// uploaded as a short final slab
+	obj := NewEmptyObject()
+	err := sdk.Upload(t.Context(), &obj, &erroringReader{
+		data: frand.Bytes(1000),
+		err:  io.ErrUnexpectedEOF,
+	}, WithRedundancy(dataShards, parityShards))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal("unexpected", err)
+	} else if obj.Size() != 0 {
+		t.Fatal("unexpected", obj.Size())
+	}
+
+	// an error returned by the read that filled the slab is not discarded
+	readErr := errors.New("read failed")
+	obj = NewEmptyObject()
+	err = sdk.Upload(t.Context(), &obj, &erroringReader{
+		data: make([]byte, dataShards*proto.SectorSize),
+		err:  readErr,
+	}, WithRedundancy(dataShards, parityShards))
+	if !errors.Is(err, readErr) {
+		t.Fatal("unexpected", err)
+	} else if obj.Size() != 0 {
+		t.Fatal("unexpected", obj.Size())
+	}
+}
+
+// racingShardUpload builds a shardUpload whose pool holds one slow host and
+// five fast hosts. Only the fast hosts have write samples, and the picker
+// prefers unsampled hosts, so the slow host wins the initial pick while the
+// seeded samples keep the race timeout small enough for a racer to beat it.
+func racingShardUpload(t *testing.T, slowDelay time.Duration, waiting *changeCounter) (*shardUpload, types.PublicKey) {
+	t.Helper()
+	sdk, hosts := newTestSDK(t, 6, zaptest.NewLogger(t))
+	t.Cleanup(func() { sdk.Close() })
+
+	usable, _ := hosts.hosts.UsableHosts()
+	slow := usable[0].PublicKey
+	var fast []types.PublicKey
+	for _, hi := range usable[1:] {
+		fast = append(fast, hi.PublicKey)
+	}
+
+	// seed fast write samples so the race timeout fires before the slow host
+	for _, hk := range fast {
+		hosts.provider.AddWriteSample(hk, proto.SectorSize, 10*time.Millisecond)
+	}
+	hosts.SetSlowHostKeys([]types.PublicKey{slow}, slowDelay)
+
+	// one slab of four shards, all of which this shard's attempts may use
+	limiter := newInflightLimiter(initialUploadInflight, minUploadInflight, 4, 1, zaptest.NewLogger(t))
+	slabCommitment, ok := limiter.commit(t.Context(), 4)
+	if !ok {
+		t.Fatal("failed to commit slab memory")
+	}
+
+	candidates := append([]types.PublicKey{slow}, fast...)
+	su := &shardUpload{
+		hosts:      hosts,
+		accountKey: sdk.appKey,
+		limiter:    limiter,
+		pool:       newUploadPool(hosts, candidates, 1),
+		commitment: slabCommitment,
+		shardsCh:   make(chan shard, 1),
+		waiting:    waiting,
+	}
+	return su, slow
+}
+
+func TestUploadRacing(t *testing.T) {
+	// upload one slab where 30 of the 50 hosts are slow. the race timeout fires
+	// first, so racers grab the leftover shards from the 20 fast hosts
+	sdk, hosts := newTestSDK(t, 50, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	slowHosts := hosts.SetSlowHosts(t, 30, 5*time.Second)
+	slowSet := make(map[types.PublicKey]bool, len(slowHosts))
+	for _, hk := range slowHosts {
+		slowSet[hk] = true
+	}
+
+	// give every host a fast write sample so the race timeout is well under 5s.
+	// without it the first estimate is about 5s and racing never kicks in
+	usable, _ := hosts.hosts.UsableHosts()
+	for _, hi := range usable {
+		hosts.provider.AddWriteSample(hi.PublicKey, proto.SectorSize, 10*time.Millisecond)
+	}
+
+	data := frand.Bytes(4096)
+	obj := NewEmptyObject()
+	err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data))
+
+	// assert the upload produced one slab
+	if err != nil {
+		t.Fatal(err)
+	} else if len(obj.Slabs()) != 1 {
+		t.Fatal("unexpected slab count", len(obj.Slabs()))
+	}
+
+	// assert racers fired: more than the 30 primary shards got write calls
+	var totalWrites int
+	for _, n := range hosts.WriteCalls() {
+		totalWrites += n
+	}
+	if totalWrites <= 30 {
+		t.Fatal("expected racing to produce extra writes", totalWrites)
+	}
+
+	// assert at least some shards landed on the fast hosts
+	var fastCount int
+	for _, sector := range obj.Slabs()[0].Sectors {
+		if !slowSet[sector.HostKey] {
+			fastCount++
+		}
+	}
+	if fastCount == 0 {
+		t.Fatal("expected shards on fast hosts")
+	}
+
+	// assert the data roundtrips
+	got, err := readAll(sdk.Download(obj))
+	if err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
+	}
+
+	// a shard whose initial host is slow must not race while another shard is
+	// still waiting for its first attempt
+	waiting := newChangeCounter(1)
+	su, slow := racingShardUpload(t, 600*time.Millisecond, waiting)
+	waiting.add(1) // this shard's own pending attempt
+	sector := make([]byte, proto.SectorSize)
+	start := time.Now()
+	go su.uploadShard(t.Context(), 0, sector)
+	res := <-su.shardsCh
+
+	// assert it waited for the slow host instead of racing
+	if res.err != nil {
+		t.Fatal(res.err)
+	} else if res.host != slow {
+		t.Fatal("expected slow host", res.host)
+	} else if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+		t.Fatal("gated shard raced", elapsed)
+	}
+
+	// the other shard starting its attempt at 150ms opens the gate, so racing
+	// should begin then instead of waiting out the 1500ms slow host
+	waiting = newChangeCounter(1)
+	su, slow = racingShardUpload(t, 1500*time.Millisecond, waiting)
+	waiting.add(1) // this shard's own pending attempt
+	time.AfterFunc(150*time.Millisecond, func() { waiting.add(-1) })
+	sector = make([]byte, proto.SectorSize)
+	start = time.Now()
+	go su.uploadShard(t.Context(), 0, sector)
+	res = <-su.shardsCh
+
+	// assert a racer won once the gate opened
+	if res.err != nil {
+		t.Fatal(res.err)
+	} else if res.host == slow {
+		t.Fatal("expected racer to win once idle")
+	} else if elapsed := time.Since(start); elapsed < 140*time.Millisecond {
+		t.Fatal("raced before the gate opened", elapsed)
+	} else if elapsed >= 1000*time.Millisecond {
+		t.Fatal("did not race when the gate opened", elapsed)
+	}
+}
+
+func TestUploadGateReleasedOnCancel(t *testing.T) {
+	waiting := newChangeCounter(0)
+	su, _ := racingShardUpload(t, 600*time.Millisecond, waiting)
+
+	// fill the limiter so the initial permit acquire blocks
+	var releases []func()
+	for range su.limiter.controller.currentLimit() {
+		release, ok := su.limiter.tryAcquire()
+		if !ok {
+			t.Fatal("failed to fill limiter")
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+
+	waiting.add(1)
+	ctx, cancel := context.WithCancel(t.Context())
+	sector := make([]byte, proto.SectorSize)
+	done := make(chan struct{})
+	go func() {
+		su.uploadShard(ctx, 0, sector)
+		close(done)
+	}()
+
+	cancel() // cancel before any permit frees
+	res := <-su.shardsCh
+	<-done
+
+	if res.err == nil {
+		t.Fatal("expected cancellation error")
+	} else if waiting.load() != 0 {
+		t.Fatal("waiting gate leaked", waiting.load())
+	}
+}
+
+func TestUploadMaxBufferedSlabs(t *testing.T) {
+	if _, _, err := newUploadOption(WithUploadMaxBufferedSlabs(-1)); err == nil {
+		t.Fatal("expected a negative max buffered slabs to fail")
+	}
+
+	// zero derives the budget from the available memory
+	if uo, _, err := newUploadOption(WithUploadMaxBufferedSlabs(0), WithRedundancy(10, 20)); err != nil {
+		t.Fatal(err)
+	} else if uo.maxBufferedSlabs != defaultSlabsInMemory(30) {
+		t.Fatal("unexpected default max buffered slabs", uo.maxBufferedSlabs)
+	}
+
+	if uo, _, err := newUploadOption(WithUploadMaxBufferedSlabs(3)); err != nil {
+		t.Fatal(err)
+	} else if uo.maxBufferedSlabs != 3 {
+		t.Fatal("unexpected max buffered slabs", uo.maxBufferedSlabs)
+	}
+
+	// an absurd budget is clamped so the shard capacity it converts to stays
+	// within the controller's ceiling, keeping the queues sized from it in step
+	uo, _, err := newUploadOption(WithUploadMaxBufferedSlabs(maxInflightLimit+1), WithRedundancy(10, 20))
+	if err != nil {
+		t.Fatal(err)
+	} else if want := maxInflightLimit / 30; uo.maxBufferedSlabs != want {
+		t.Fatalf("expected max buffered slabs clamped to %d, got %d", want, uo.maxBufferedSlabs)
+	} else if capacity := uo.maxBufferedSlabs * 30; capacity > maxInflightLimit {
+		t.Fatal("clamped slab budget still exceeds the inflight ceiling", capacity)
+	}
+}
+
+// TestUploadInflight asserts uploads release their inflight
+// reservations and avoid busy hosts.
+func TestUploadInflight(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 40, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	// saturate 5 hosts with inflight writes so PickWrite steers the upload
+	// onto the 35 idle ones
+	usable, _ := hosts.hosts.UsableHosts()
+	busy := make(map[types.PublicKey]bool)
+	var releases []func()
+	for _, hi := range usable[:5] {
+		busy[hi.PublicKey] = true
+		for range 5 {
+			releases = append(releases, hosts.provider.TrackInflightWrite(hi.PublicKey))
+		}
+	}
+
+	data := frand.Bytes(int(proto.SectorSize) * 10) // one slab, 30 shards
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	// the upload's own reservations must all be released
+	hosts.waitInflightDrained(t)
+
+	// the slab's shards should land mostly on idle hosts
+	var onBusy int
+	for _, slab := range obj.Slabs() {
+		for _, sector := range slab.Sectors {
+			if busy[sector.HostKey] {
+				onBusy++
+			}
+		}
+	}
+	if onBusy > 5 {
+		t.Fatal("too many shards on busy hosts, inflight not respected", onBusy)
+	}
+
+	for _, r := range releases {
+		r()
+	}
+}

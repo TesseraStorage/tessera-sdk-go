@@ -30,8 +30,21 @@ import (
 const pinBatchSize = 50
 
 type (
-	// A hostClient is an interface for interacting with hosts.
-	hostClient interface {
+	// A HostClient is an interface for interacting with hosts.
+	//
+	// EXPORTED (Tessera fork). The stock SDK keeps this unexported with no public setter, so an
+	// integrator cannot observe the host transport. Two events that exist inside this interface
+	// are unavailable anywhere else in the public API:
+	//
+	//	PickWrite     -- a host has been selected and a shard write is ABOUT TO START on it
+	//	AddFailedRPC  -- a host's RPC FAILED
+	//
+	// WithUploadProgress cannot substitute for either: ShardProgress "reports the result of a
+	// successfully completed shard upload" (sdk.go), fires once per shard, and names only the
+	// winner. A host that was picked, failed, and was swapped out by pool.swap() leaves NO trace
+	// in the public API at all -- so per-host failure attribution and any "write in flight"
+	// indication are both impossible without this seam.
+	HostClient interface {
 		Prices(ctx context.Context, hostKey types.PublicKey) (prices proto4.HostPrices, err error)
 		ReadSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
 		WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error)
@@ -45,6 +58,12 @@ type (
 		UploadQueue() (*client.HostQueue, error)
 		Close() error
 	}
+
+	// hostClient is retained as an alias so every existing use inside the package -- including
+	// connect.go's mockHost field and the test suite -- compiles unchanged. Renaming call sites
+	// would turn an additive change into a sweeping one, which is exactly what makes a fork hard
+	// to rebase and hard to propose upstream.
+	hostClient = HostClient
 
 	// An appClient is an interface for the application API of the indexer.
 	appClient interface {
@@ -94,8 +113,10 @@ type (
 
 	// An SDK is a client for the indexd service.
 	SDK struct {
-		app        appClient
-		hosts      hostClient
+		app   appClient
+		hosts hostClient
+		// wrapHosts, when set by WithHostClient, decorates `hosts` once the real client exists.
+		wrapHosts  func(HostClient) HostClient
 		hostsCache *hostCache
 
 		appKey types.PrivateKey
@@ -1157,6 +1178,33 @@ type Option func(*SDK)
 
 // WithLogger sets the logger for the SDK. The default behavior is to not log
 // anything.
+// WithHostClient wraps the SDK's host transport, allowing an integrator to observe host-level
+// events that are otherwise invisible: a write starting on a specific host (PickWrite), a host RPC
+// failing (AddFailedRPC), and the release of a write slot.
+//
+// The function receives the SDK's own fully-configured HostClient and must return a value that
+// delegates to it. Returning the argument unchanged is a no-op. It is applied after construction,
+// so a wrapper can observe how writes proceed but cannot change how hosts are reached.
+//
+// TESSERA FORK ADDITION. Rationale, for the upstream proposal:
+//
+//	WithUploadProgress reports only SUCCESSFUL, COMPLETED shard transfers and names only the host
+//	that won. upload.go's pool.swap() silently substitutes a failed host and reports the
+//	substitute's success, so from the public API a slow or failing host is INDISTINGUISHABLE FROM
+//	A HOST THAT WAS NEVER ASKED. That makes two legitimate integrator needs impossible:
+//	per-host reliability measurement, and any live "write in flight" indication.
+//
+//	The seam already exists internally (connect.go's mockHost field is this same interface), so
+//	this exposes an existing abstraction rather than introducing one.
+func WithHostClient(fn func(HostClient) HostClient) Option {
+	return func(s *SDK) {
+		if fn == nil {
+			return
+		}
+		s.wrapHosts = fn
+	}
+}
+
 func WithLogger(log *zap.Logger) Option {
 	return func(s *SDK) {
 		s.log = log
@@ -1178,6 +1226,14 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 
 	// create the host client
 	sdk.hosts = client.New(client.NewProvider(sdk.hostsCache), sdk.log.Named("client"))
+	// Apply the WithHostClient decorator AFTER the real transport exists, so a wrapper always
+	// receives a fully-configured client and can only observe -- never replace -- how hosts are
+	// reached. (Tessera fork addition.)
+	if sdk.wrapHosts != nil {
+		if wrapped := sdk.wrapHosts(sdk.hosts); wrapped != nil {
+			sdk.hosts = wrapped
+		}
+	}
 
 	// update hosts and warm connections on init
 	err := sdk.refreshHosts(context.Background(), true)

@@ -501,6 +501,16 @@ func (mc *mockAppClient) Hosts(context.Context, types.PrivateKey, ...api.URLQuer
 	return mc.hosts.UsableHosts()
 }
 
+// ObjectHosts implements the [appClient] interface. The mock does not track
+// per-object host membership, so it mirrors Hosts (same override, same
+// backing store) -- tests that need to simulate a real indexd's map should
+// use SetHosts, which both Hosts and ObjectHosts now read from.
+//
+// TESSERA FORK.
+func (mc *mockAppClient) ObjectHosts(ctx context.Context, appKey types.PrivateKey, _ types.Hash256) ([]hosts.HostInfo, error) {
+	return mc.Hosts(ctx, appKey)
+}
+
 // SetHosts overrides the host list returned by Hosts.
 func (mc *mockAppClient) SetHosts(hi []hosts.HostInfo) {
 	mc.mu.Lock()

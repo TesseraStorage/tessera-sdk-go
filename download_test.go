@@ -68,7 +68,7 @@ func TestDownloadMaxBufferedChunks(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancelCause(t.Context())
 	cancel(nil)
-	downloader := newChunkDownloader(ctx, cancel, sdk, new([32]byte), []slabs.SlabSlice{{MinShards: 10}}, do)
+	downloader := newChunkDownloader(ctx, cancel, sdk, sdk.hosts, new([32]byte), []slabs.SlabSlice{{MinShards: 10}}, do)
 	if got := downloader.limiter.controller.capacity; got != 3 {
 		t.Fatalf("expected capacity 3, got %d", got)
 	} else if got := downloader.limiter.controller.currentLimit(); got != 3 {
@@ -445,7 +445,7 @@ func TestDownloadRacing(t *testing.T) {
 
 	// assert the chunk waited for the slow host instead of racing
 	limiter := newInflightLimiter(initialDownloadInflight, minDownloadInflight, 80, int(chunk.MinShards), zaptest.NewLogger(t))
-	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, raceWindow, popped, limiter, time.Minute, nil); err != nil {
+	if _, err := sdk.downloadSlab(t.Context(), sdk.hosts, chunk, 0, raceWindow, popped, limiter, time.Minute, nil); err != nil {
 		t.Fatal(err)
 	} else if elapsed := time.Since(start); elapsed < 1200*time.Millisecond {
 		t.Fatal("gated chunk should have waited, not raced", elapsed)
@@ -462,7 +462,7 @@ func TestDownloadRacing(t *testing.T) {
 
 	// assert racing started when the window opened, not after the slow delay
 	limiter = newInflightLimiter(initialDownloadInflight, minDownloadInflight, 80, int(chunk.MinShards), zaptest.NewLogger(t))
-	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, raceWindow, popped, limiter, time.Minute, nil); err != nil {
+	if _, err := sdk.downloadSlab(t.Context(), sdk.hosts, chunk, 0, raceWindow, popped, limiter, time.Minute, nil); err != nil {
 		t.Fatal(err)
 	} else if elapsed := time.Since(start); elapsed < 190*time.Millisecond {
 		t.Fatal("raced before the window opened", elapsed)

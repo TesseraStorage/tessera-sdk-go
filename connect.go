@@ -222,8 +222,13 @@ func (b *Builder) SDK(appKey types.PrivateKey, opts ...Option) (*SDK, error) {
 			app:        b.mockApp,
 			hosts:      b.mockHost,
 			hostsCache: b.mockHostCache,
-			tg:         threadgroup.New(),
-			log:        zap.NewNop(),
+			// mock builds hand every download the SAME mock hostClient,
+			// ignoring the job-scoped store -- the mock records RPCs by
+			// pubkey/root, not by which Provider/store backs it. (Tessera
+			// fork)
+			newHosts: func(*hostCache) hostClient { return b.mockHost },
+			tg:       threadgroup.New(),
+			log:      zap.NewNop(),
 		}
 		for _, opt := range opts {
 			opt(sdk)

@@ -232,11 +232,18 @@ func (o *packedObject) slabRange(slabSize int64) (start, end int64) {
 // packed together for more efficient uploads. The returned PackedUpload can be
 // used to add objects and then finalized to get the resulting objects. A packed
 // upload is not thread-safe.
+//
+// TESSERA FORK: same write-start-fetch law
+// as [SDK.Upload] -- see that method's comment.
 func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 	// create upload options
 	uo, enc, err := newUploadOption(opts...)
 	if err != nil {
 		return nil, err
+	}
+
+	if err := s.refreshHosts(context.Background(), true); err != nil {
+		return nil, fmt.Errorf("failed to refresh hosts at write start: %w", err)
 	}
 
 	// create packed upload

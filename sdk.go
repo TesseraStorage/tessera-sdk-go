@@ -71,6 +71,14 @@ type (
 
 		Hosts(context.Context, types.PrivateKey, ...api.URLQueryParameterOption) ([]hosts.HostInfo, error)
 
+		// ObjectHosts returns the current, post-repair set of hosts storing
+		// the given object's shards -- indexd's `GET /objects/:key/hosts`.
+		//
+		// TESSERA FORK: backs
+		// [SDK.Download]'s job-scoped, read-start-only host map. Product
+		// law: downloads never call the write-path Hosts/GET /hosts.
+		ObjectHosts(ctx context.Context, appKey types.PrivateKey, key types.Hash256) ([]hosts.HostInfo, error)
+
 		CreateSharedObjectURL(ctx context.Context, appKey types.PrivateKey, objectID types.Hash256, encryptionKey []byte, validUntil time.Time) (string, error)
 		SharedObject(ctx context.Context, sharedURL string) (slabs.SharedObject, []byte, error)
 
@@ -119,6 +127,18 @@ type (
 		wrapHosts  func(HostClient) HostClient
 		hostsCache *hostCache
 
+		// newHosts builds a hostClient over a given host store. Production
+		// code always builds a real client.New(client.NewProvider(store), ...);
+		// mocked SDKs override this to hand back the same mock client
+		// regardless of store, so a download's job-scoped map still exercises
+		// the mock's recorded RPC behavior.
+		//
+		// TESSERA FORK: lets
+		// [SDK.Download] build a fresh, job-scoped hostClient over a
+		// download-only host store, isolated from the shared write-path
+		// hostsCache.
+		newHosts func(*hostCache) hostClient
+
 		appKey types.PrivateKey
 
 		tg  *threadgroup.ThreadGroup
@@ -141,7 +161,7 @@ type sectorDownload struct {
 	sector slabs.PinnedSector
 }
 
-func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, limiter *inflightLimiter, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
+func (s *SDK) downloadSlab(ctx context.Context, hc hostClient, slab slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, limiter *inflightLimiter, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
 	if slab.MinShards == 0 {
 		return nil, errors.New("invalid slab: min shards cannot be 0")
 	} else if int(slab.MinShards) > len(slab.Sectors) {
@@ -178,7 +198,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 	offset, length := sectorRegion(slab)
 
 	// prioritize hosts, dropping any that are no longer usable
-	slabHosts = s.hosts.Prioritize(slabHosts)
+	slabHosts = hc.Prioritize(slabHosts)
 	// check after prioritizing since it removes unusable hosts, leaving
 	// potentially fewer than the initial batch below consumes
 	if len(slabHosts) < int(slab.MinShards) {
@@ -197,7 +217,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 	var outstanding int
 	tryDownloadSector := func(d sectorDownload) {
 		outstanding++
-		release := s.hosts.TrackInflightRead(d.sector.HostKey)
+		release := hc.TrackInflightRead(d.sector.HostKey)
 		wg.Go(func() {
 			defer release()
 			permit := limiter.sample()
@@ -205,7 +225,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 			defer cancel()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
 			start := time.Now()
-			_, err := s.hosts.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
+			_, err := hc.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
 			elapsed := time.Since(start)
 			// a read aborted because the chunk already had enough shards
 			// measured the cancellation, not the network, so it is not a
@@ -227,7 +247,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 			// cancelled because the chunk completed without them are expected
 			// with overprovisioning and do not count against the host
 			if timeoutCtx.Err() != nil && ctx.Err() == nil {
-				s.hosts.AddFailedRPC(d.sector.HostKey)
+				hc.AddFailedRPC(d.sector.HostKey)
 			}
 		})
 	}
@@ -243,7 +263,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 
 	// only race a host once it is clearly slower than normal. before we have
 	// timing data the estimate is large, so racing stays off until it warms up.
-	raceTimeout := time.Duration(float64(s.hosts.ReadEstimate(length)) * raceFactor)
+	raceTimeout := time.Duration(float64(hc.ReadEstimate(length)) * raceFactor)
 	lastEvent := time.Now()
 
 	var successful int
@@ -347,9 +367,19 @@ func (s *SDK) DeleteObject(ctx context.Context, key types.Hash256) error {
 // Appends the metadata of the slabs that were uploaded to the given object.
 // After uploading the object, the caller must call PinObject to pin the
 // slabs and save the object metadata to the indexer.
+//
+// TESSERA FORK: fetches the write-path
+// host plate (GET /hosts, paginated) once, here, at write-job start. connect
+// no longer does this -- see initSDK -- and there is no periodic background
+// refresh; a long-lived SDK's write-path list is only as fresh as its last
+// Upload/UploadPacked call.
 func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	if err := s.refreshHosts(ctx, true); err != nil {
+		return fmt.Errorf("failed to refresh hosts at write start: %w", err)
+	}
 
 	// create upload options
 	uo, enc, err := newUploadOption(opts...)
@@ -385,6 +415,13 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 // Download returns an [io.ReadCloser] streaming the object's data. Closing the
 // reader cancels the underlying download. Callers must always Close the
 // returned reader to release resources.
+//
+// TESSERA FORK: read start fetches THIS
+// object's map -- GET /objects/:key/hosts, via [appClient.ObjectHosts] --
+// once, into a fresh, job-scoped hostClient that shares no state with the
+// write-path SDK.hosts/hostsCache Upload populates. It is used for this
+// download only and closed when the returned reader is closed. Product law:
+// never call GET /hosts to help a download, never reuse the write-path plate.
 func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
 	do, err := newDownloadOption(obj.Size(), opts...)
 	if err != nil {
@@ -401,12 +438,31 @@ func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error
 		return nil, err
 	}
 
-	return s.downloadReader((*[32]byte)(obj.dataKey), obj.slabs, do)
+	mapHosts, err := s.app.ObjectHosts(context.Background(), s.appKey, obj.ID())
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch object host map: %w", err)
+	}
+	scoped := newHostCache()
+	scoped.updateHosts(mapHosts)
+	hc := s.newHosts(scoped)
+
+	return s.downloadReader(hc, (*[32]byte)(obj.dataKey), obj.slabs, do)
 }
 
 // DownloadSharedObject returns an [io.ReadCloser] streaming a shared object's
 // data. Closing the reader cancels the underlying download. Callers must always
 // Close the returned reader to release resources.
+//
+// KNOWN GAP (TESSERA FORK): a shared object
+// belongs to a DIFFERENT account than s.appKey, so indexd's authenticated
+// GET /objects/:key/hosts (scoped to the caller's own account) cannot be used
+// here -- unlike [SDK.Download], this path still reads from the shared,
+// write-path s.hosts/hostsCache, which Upload/UploadPacked populate and
+// nothing else does since connect-time/periodic refresh were removed. A
+// process that only ever calls DownloadSharedObject (never Upload) now starts
+// with an EMPTY host cache. Out of scope for this packet (four laws are
+// specified for object()/download() of an app's own objects); flagged here
+// rather than silently left broken.
 func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts ...DownloadOption) (io.ReadCloser, error) {
 	obj, encryptionKey, err := s.app.SharedObject(ctx, sharedURL)
 	if err != nil {
@@ -429,15 +485,15 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 		return nil, err
 	}
 
-	return s.downloadReader((*[32]byte)(encryptionKey), obj.Slabs, do)
+	return s.downloadReader(s.hosts, (*[32]byte)(encryptionKey), obj.Slabs, do)
 }
 
 // downloadReader starts recovering chunks immediately and streams them to the
 // reader, so the first bytes are ready as early as possible. Closing the
 // returned reader cancels any chunk downloads in flight.
-func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) (io.ReadCloser, error) {
+func (s *SDK) downloadReader(hc hostClient, key *[32]byte, ss []slabs.SlabSlice, do downloadOption) (io.ReadCloser, error) {
 	ctx, cancel := context.WithCancelCause(context.Background())
-	chunks := newChunkDownloader(ctx, cancel, s, key, ss, do)
+	chunks := newChunkDownloader(ctx, cancel, s, hc, key, ss, do)
 	chunks.start()
 	return &downloadStream{chunks: chunks}, nil
 }
@@ -703,8 +759,8 @@ type recoveredChunk struct {
 	writeLen int
 }
 
-func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, limiter *inflightLimiter, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
-	shards, err := s.downloadSlab(ctx, chunk, slabIndex, seq, popped, limiter, hostTimeout, onProgress)
+func (s *SDK) recoverChunk(ctx context.Context, hc hostClient, chunk slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, limiter *inflightLimiter, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
+	shards, err := s.downloadSlab(ctx, hc, chunk, slabIndex, seq, popped, limiter, hostTimeout, onProgress)
 	if err != nil {
 		return recoveredChunk{}, fmt.Errorf("failed to download slab: %w", err)
 	}
@@ -784,6 +840,7 @@ type chunkDownloader struct {
 	ctx         context.Context
 	cancel      context.CancelCauseFunc
 	key         *[32]byte
+	hc          hostClient // job-scoped host client for this download only (TESSERA FORK)
 	hostTimeout time.Duration
 	onProgress  func(ShardProgress)
 	bufs        *chunkBufPool
@@ -827,7 +884,7 @@ func (p *chunkBufPool) put(buf []byte) {
 
 // newChunkDownloader builds a chunkDownloader; the caller launches its
 // dispatcher via start.
-func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *SDK, key *[32]byte, ss []slabs.SlabSlice, do downloadOption) *chunkDownloader {
+func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *SDK, hc hostClient, key *[32]byte, ss []slabs.SlabSlice, do downloadOption) *chunkDownloader {
 	// the controller samples sector reads but limits chunk recoveries, and each
 	// recovery issues about MinShards reads, so scale its window accordingly
 	scale := 1
@@ -839,6 +896,7 @@ func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *
 		ctx:         ctx,
 		cancel:      cancel,
 		key:         key,
+		hc:          hc,
 		hostTimeout: do.hostTimeout,
 		onProgress:  do.onProgress,
 		bufs:        newChunkBufPool(),
@@ -915,7 +973,7 @@ func (c *chunkDownloader) recoverAndDecrypt(seq int, chunk chunkSlab) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	rc, err := c.s.recoverChunk(c.ctx, chunk.slab, chunk.slabIdx, seq, c.popped, c.limiter, c.hostTimeout, c.onProgress)
+	rc, err := c.s.recoverChunk(c.ctx, c.hc, chunk.slab, chunk.slabIdx, seq, c.popped, c.limiter, c.hostTimeout, c.onProgress)
 	if err != nil {
 		return nil, err
 	}
@@ -1235,35 +1293,29 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 		}
 	}
 
-	// update hosts and warm connections on init
-	err := sdk.refreshHosts(context.Background(), true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to refresh hosts: %w", err)
-	}
-
-	// refresh hosts every 10 minutes in the background
-	ctx, cancel, err := sdk.tg.AddContext(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	go func() {
-		defer cancel()
-
-		t := time.NewTicker(10 * time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
+	// newHosts builds the job-scoped hostClient a Download call uses over its
+	// own per-object map. Defaults to a real client.New over the given store,
+	// decorated the same way as the write-path client above. (Tessera fork,
+	// Tessera fork)
+	if sdk.newHosts == nil {
+		sdk.newHosts = func(store *hostCache) hostClient {
+			hc := hostClient(client.New(client.NewProvider(store), sdk.log.Named("client")))
+			if sdk.wrapHosts != nil {
+				if wrapped := sdk.wrapHosts(hc); wrapped != nil {
+					hc = wrapped
+				}
 			}
-
-			err := sdk.refreshHosts(ctx, false)
-			if err != nil {
-				sdk.log.Warn("failed to refresh hosts", zap.Error(err))
-			}
+			return hc
 		}
-	}()
+	}
 
+	// TESSERA FORK: connect/init must NOT
+	// call GET /hosts, and there is no periodic background refresh anymore.
+	// The old code called sdk.refreshHosts(..., true) here and then spawned a
+	// 10-minute-ticker background refresh loop -- both removed. hostsCache
+	// starts empty; SDK.Upload/UploadPacked populate it at their own job
+	// start, and SDK.Download never touches it at all (job-scoped map
+	// instead). See SDK.Upload and SDK.Download for where each half of this
+	// law now lives.
 	return sdk, nil
 }

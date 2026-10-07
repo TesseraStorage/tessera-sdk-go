@@ -141,6 +141,13 @@ type (
 
 		appKey types.PrivateKey
 
+		// egress reports successfully served shard reads to the configured
+		// endpoint; nil when no egress URL is configured (reporting off).
+		egress *egressReporter
+		// egressCfg collects the egress options until initEgress builds the
+		// reporter.
+		egressCfg egressConfig
+
 		tg  *threadgroup.ThreadGroup
 		log *zap.Logger
 	}
@@ -1269,11 +1276,48 @@ func WithLogger(log *zap.Logger) Option {
 	}
 }
 
+// WithEgressURL enables signed egress reporting to the given endpoint, e.g.
+// "http://indexer/api/v1/usage/egress". Reporting is disabled by default;
+// without a URL no reporter is started and serving a shard does not record
+// anything.
+func WithEgressURL(url string) Option {
+	return func(s *SDK) {
+		s.egressCfg.url = url
+	}
+}
+
+// WithEgressInterval sets how long queued egress events may wait before they
+// are reported. The default is 30 seconds.
+func WithEgressInterval(interval time.Duration) Option {
+	return func(s *SDK) {
+		s.egressCfg.interval = interval
+	}
+}
+
+// WithEgressBatchMax sets the number of queued egress events that triggers an
+// immediate flush. The default is 500.
+func WithEgressBatchMax(max int) Option {
+	return func(s *SDK) {
+		s.egressCfg.batchMax = max
+	}
+}
+
+// WithEgressSpoolPath sets a file used to spool signed egress envelopes that
+// could not be delivered, so they survive process restarts. The spool holds
+// one canonical envelope per line and is bounded at 8 MiB, oldest dropped.
+// Empty (the default) disables the spool.
+func WithEgressSpoolPath(path string) Option {
+	return func(s *SDK) {
+		s.egressCfg.spoolPath = path
+	}
+}
+
 func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, error) {
 	sdk := &SDK{
 		appKey:     appKey,
 		app:        app,
 		hostsCache: newHostCache(),
+		egressCfg:  defaultEgressConfig(),
 
 		tg:  threadgroup.New(),
 		log: zap.NewNop(), // no logging by default
@@ -1317,5 +1361,9 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 	// start, and SDK.Download never touches it at all (job-scoped map
 	// instead). See SDK.Upload and SDK.Download for where each half of this
 	// law now lives.
+
+	// start egress reporting if WithEgressURL configured it (this must run
+	// after every Option has been applied)
+	sdk.initEgress()
 	return sdk, nil
 }

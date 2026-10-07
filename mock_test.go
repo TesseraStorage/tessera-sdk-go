@@ -662,6 +662,88 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, opts 
 	return nil
 }
 
+// egressCapture is the offline transport seam for egress tests: it records
+// every envelope the reporter posts and returns scripted errors.
+type egressCapture struct {
+	mu       sync.Mutex
+	attempts [][]byte
+	errors   []error
+}
+
+func (c *egressCapture) post(_ context.Context, envelope []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.attempts = append(c.attempts, append([]byte(nil), envelope...))
+	if len(c.errors) == 0 {
+		return nil
+	}
+	err := c.errors[0]
+	c.errors = c.errors[1:]
+	return err
+}
+
+// failNext makes the next post attempt return err.
+func (c *egressCapture) failNext(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errors = append(c.errors, err)
+}
+
+// bodies returns a copy of every envelope posted so far.
+func (c *egressCapture) bodies() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([][]byte, len(c.attempts))
+	for i, body := range c.attempts {
+		out[i] = append([]byte(nil), body...)
+	}
+	return out
+}
+
+// count returns the number of post attempts so far.
+func (c *egressCapture) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.attempts)
+}
+
+// withEgressCapture is a test-only [Option] that routes the reporter's
+// network send through c before the flusher starts, keeping egress tests
+// offline and deterministic.
+func withEgressCapture(c *egressCapture) Option {
+	return func(s *SDK) { s.egressCfg.post = c.post }
+}
+
+// newMockEgressSDK builds a mock SDK with the given options; callers enable
+// reporting with WithEgressURL.
+func newMockEgressSDK(t testing.TB, opts ...Option) *SDK {
+	t.Helper()
+	appKey := types.GeneratePrivateKey()
+	hostStore := newMockHostStore(1)
+	hostMock := newMockHostClient(hostStore)
+	appMock := newMockAppClient(hostStore)
+	sdk, err := newMockBuilder(appMock, hostMock, hostStore).SDK(appKey, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sdk
+}
+
+// newEgressTestSDK creates an egress-enabled mock SDK whose network send is
+// an offline capture.
+func newEgressTestSDK(t testing.TB, opts ...Option) (*SDK, *egressCapture) {
+	t.Helper()
+	capture := &egressCapture{}
+	sdk := newMockEgressSDK(t, append([]Option{
+		WithEgressURL("http://egress.test/api/v1/usage/egress"),
+		withEgressCapture(capture),
+	}, opts...)...)
+	if sdk.egress == nil {
+		t.Fatal("egress reporter not configured")
+	}
+	return sdk, capture
+}
+
 // newMockBuilder creates a Builder backed by mock implementations.
 func newMockBuilder(app appClient, hosts hostClient, hostStore *hostCache) *Builder {
 	return &Builder{

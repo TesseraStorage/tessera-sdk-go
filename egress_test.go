@@ -473,6 +473,110 @@ func TestEgressSpoolBoundedDropsOldest(t *testing.T) {
 	}
 }
 
+// TestEgressSpoolRemovalFailureIsPaced verifies that when a delivered or
+// 4xx-rejected envelope cannot be removed from the spool (disk failure), it
+// stays recorded and the reporter arms the normal retry backoff instead of
+// hot-looping: the flusher's next wait is positive and an immediate flusher
+// pass does not re-post the same line. Once the disk recovers, the envelope
+// drains normally.
+//
+// The failure is injected through the config's spool-writer seam because
+// chmod cannot fail writes for root, and the test process may run as root.
+func TestEgressSpoolRemovalFailureIsPaced(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reject bool
+	}{
+		{name: "delivered"},
+		{name: "rejected-400", reject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spoolPath := filepath.Join(t.TempDir(), "egress.spool")
+			capture := &egressCapture{}
+			if tc.reject {
+				capture.failNext(&egressSendError{status: http.StatusBadRequest})
+				capture.failNext(&egressSendError{status: http.StatusBadRequest})
+			}
+
+			var failWrites bool
+			var writes int
+			reporter := newEgressReporter(egressConfig{
+				url:       "http://egress.test/api/v1/usage/egress",
+				interval:  time.Hour,
+				batchMax:  500,
+				spoolPath: spoolPath,
+				post:      capture.post,
+				writeSpoolFile: func(path string, data []byte) error {
+					writes++
+					if failWrites {
+						return errors.New("injected spool write failure")
+					}
+					return os.WriteFile(path, data, 0o600)
+				},
+			}, types.GeneratePrivateKey(), zap.NewNop())
+
+			envelope := []byte(`{"batch_id":"0123456789abcdef0123456789abcdef"}`)
+			if err := reporter.spoolAppend(envelope); err != nil {
+				t.Fatalf("failed to seed spool: %v", err)
+			}
+
+			// The seed append succeeds; the removal rewrite fails.
+			failWrites = true
+			reporter.send(envelope, egressSourceSpool)
+			if got := capture.count(); got != 1 {
+				t.Fatalf("post attempts = %d, want 1", got)
+			}
+			if writes != 2 {
+				t.Fatalf("spool writes = %d, want 2 (seed + failed removal attempt)", writes)
+			}
+			if at := reporter.retryDeadline(); at.IsZero() || !at.After(time.Now()) {
+				t.Fatalf("retry deadline = %v, want a future deadline after failed removal", at)
+			}
+
+			// An immediate flusher pass must honor the deadline and leave the
+			// recorded envelope alone; a paced wait, not zero, prevents the
+			// hot re-send loop.
+			reporter.flushOnce(false)
+			if got := capture.count(); got != 1 {
+				t.Fatalf("the flusher re-sent during backoff: %d attempt(s)", got)
+			}
+			if wait := reporter.nextWait(time.Now()); wait < egressRetryBase/2 {
+				t.Fatalf("next flusher wait = %v, want backoff-scale pacing", wait)
+			}
+			spooled, err := os.ReadFile(spoolPath)
+			if err != nil {
+				t.Fatalf("failed to read spool: %v", err)
+			}
+			if lines := bytes.Split(bytes.TrimSuffix(spooled, []byte("\n")), []byte("\n")); len(lines) != 1 || !bytes.Equal(lines[0], envelope) {
+				t.Fatalf("spool = %q, want the unremoved envelope", spooled)
+			}
+
+			// Simulate the disk recovering and the deadline elapsing (rewind
+			// it rather than sleeping through the whole backoff).
+			failWrites = false
+			reporter.mu.Lock()
+			reporter.retryAt = time.Now().Add(-time.Millisecond)
+			reporter.mu.Unlock()
+
+			reporter.flushOnce(false)
+			if got := capture.count(); got != 2 {
+				t.Fatalf("post attempts after recovery = %d, want 2", got)
+			}
+			if writes != 3 {
+				t.Fatalf("spool writes = %d, want 3 (recovery removal)", writes)
+			}
+			if at := reporter.retryDeadline(); !at.IsZero() {
+				t.Fatalf("retry deadline = %v after successful removal, want cleared", at)
+			}
+			if spooled, err := os.ReadFile(spoolPath); err != nil {
+				t.Fatalf("failed to read spool: %v", err)
+			} else if len(spooled) != 0 {
+				t.Fatalf("spool = %q after successful removal, want empty", spooled)
+			}
+		})
+	}
+}
+
 // TestEgressCloseStopsFlusher verifies Close stops the reporter goroutine
 // cleanly through the SDK's thread group.
 func TestEgressCloseStopsFlusher(t *testing.T) {

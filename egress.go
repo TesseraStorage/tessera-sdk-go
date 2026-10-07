@@ -77,6 +77,10 @@ type (
 		// post overrides the reporter's transport; tests install an offline
 		// capture here (see withEgressCapture).
 		post func(ctx context.Context, envelope []byte) error
+
+		// writeSpoolFile overrides the spool writer; tests install a
+		// filesystem error injector here.
+		writeSpoolFile func(path string, data []byte) error
 	}
 
 	// egressEvent is one successfully served shard read.
@@ -109,6 +113,9 @@ type (
 
 		client *http.Client
 		post   func(ctx context.Context, envelope []byte) error
+
+		// writeSpoolFile overrides spool writes when set (test seam).
+		writeSpoolFile func(path string, data []byte) error
 
 		// ctx cancels in-flight sends when the SDK closes.
 		ctx context.Context
@@ -184,6 +191,7 @@ func newEgressReporter(cfg egressConfig, appKey types.PrivateKey, log *zap.Logge
 	} else {
 		r.post = r.postHTTP
 	}
+	r.writeSpoolFile = cfg.writeSpoolFile
 	return r
 }
 
@@ -360,26 +368,21 @@ func (r *egressReporter) flushOnce(force bool) {
 // propagates an error: a retryable failure keeps the identical envelope (in
 // the spool when one is configured, otherwise in memory) for a later attempt,
 // and a rejected batch is dropped with a log line so it cannot poison the
-// queue.
+// queue. An envelope whose spool line cannot be removed after delivery or
+// rejection stays recorded and is retried under the normal backoff.
 func (r *egressReporter) send(envelope []byte, source egressSource) {
 	defer r.signal()
 
 	err := r.post(r.postContext(), envelope)
 	if err == nil {
-		r.clearRetry()
-		if source == egressSourceSpool {
-			r.spoolRemoveFirst()
-		}
+		r.settle(source)
 		return
 	}
 
 	var rejected *egressSendError
 	if errors.As(err, &rejected) && !rejected.retryable() {
 		r.log.Warn("egress reporter: batch rejected, dropping", zap.Int("status", rejected.status))
-		r.clearRetry()
-		if source == egressSourceSpool {
-			r.spoolRemoveFirst()
-		}
+		r.settle(source)
 		return
 	}
 
@@ -397,6 +400,22 @@ func (r *egressReporter) send(envelope []byte, source egressSource) {
 		}
 	}
 	r.setPending(envelope)
+}
+
+// settle finishes a delivered or rejected envelope. A spooled envelope must
+// actually leave the spool before the reporter clears its retry state, because
+// [egressReporter.nextWait] treats any spool work as immediately runnable.
+// When the removal write fails, the envelope remains recorded and a retry is
+// scheduled, pacing the next attempt through the normal backoff instead of
+// re-reading and re-posting the same line in a hot loop.
+func (r *egressReporter) settle(source egressSource) {
+	if source == egressSourceSpool {
+		if err := r.spoolRemoveFirst(); err != nil {
+			r.scheduleRetry()
+			return
+		}
+	}
+	r.clearRetry()
 }
 
 // postContext returns the reporter's lifetime context, which is cancelled
@@ -576,24 +595,28 @@ func (r *egressReporter) spoolAppend(envelope []byte) error {
 }
 
 // spoolRemoveFirst drops the oldest spooled envelope after it was delivered
-// or rejected.
-func (r *egressReporter) spoolRemoveFirst() {
+// or rejected. It returns an error when the spool cannot be rewritten, in
+// which case the envelope is still recorded on disk and the caller must keep
+// it scheduled for a paced retry.
+func (r *egressReporter) spoolRemoveFirst() error {
 	if r.spoolPath == "" {
-		return
+		return nil
 	}
 	r.spoolMu.Lock()
 	defer r.spoolMu.Unlock()
 	lines, err := r.readSpool()
 	if err != nil {
 		r.log.Warn("egress reporter: failed to read spool", zap.String("path", r.spoolPath), zap.Error(err))
-		return
+		return err
 	}
 	if len(lines) == 0 {
-		return
+		return nil
 	}
 	if err := r.writeSpool(lines[1:]); err != nil {
 		r.log.Warn("egress reporter: failed to write spool", zap.String("path", r.spoolPath), zap.Error(err))
+		return err
 	}
+	return nil
 }
 
 // readSpool returns one non-empty line per spooled envelope. A missing file
@@ -615,12 +638,16 @@ func (r *egressReporter) readSpool() ([][]byte, error) {
 	return lines, nil
 }
 
-// writeSpool rewrites the spool as JSON lines.
+// writeSpool rewrites the spool as JSON lines. The writer is overridable via
+// the config's test seam so tests can inject filesystem failures.
 func (r *egressReporter) writeSpool(lines [][]byte) error {
 	var buf bytes.Buffer
 	for _, line := range lines {
 		buf.Write(line)
 		buf.WriteByte('\n')
+	}
+	if r.writeSpoolFile != nil {
+		return r.writeSpoolFile(r.spoolPath, buf.Bytes())
 	}
 	return os.WriteFile(r.spoolPath, buf.Bytes(), 0o600)
 }

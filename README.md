@@ -93,6 +93,39 @@ metadata required to download the data later. After uploading, call
 `PinObject` to persist the object on the indexer. Applications should store
 the sealed object (via `obj.Seal(appKey)`) so it can be reopened later.
 
+## Egress Reporting
+
+Downloads can report served-shard egress to a Tessera moneyd endpoint so the
+account's usage and allowance are metered server-side. Reporting is opt-in and
+stays disabled until `WithEgressURL` is set; without it nothing is recorded.
+
+```go
+client, err := builder.SDK(appKey,
+	siastorage.WithEgressURL("https://tessera.storage/api/v1/usage/egress"),
+	siastorage.WithEgressInterval(30*time.Second), // default: how long an event may wait
+	siastorage.WithEgressBatchMax(500),            // default: events per batch
+	siastorage.WithEgressSpoolPath("/var/lib/myapp/egress.spool")) // default: disabled
+if err != nil {
+	log.Fatal("failed to create SDK:", err)
+}
+```
+
+- `WithEgressURL` enables reporting. `WithEgressInterval` bounds how long a
+  queued event waits before it is flushed, and `WithEgressBatchMax` flushes
+  immediately once that many events are queued.
+- Recording is a cheap in-memory append: reads never block on the reporter and
+  a failed report never fails a read. The queue is bounded (oldest events
+  dropped); failed sends retry the identical signed envelope with exponential
+  backoff (1s to 60s), and non-retryable responses are dropped with a log line.
+- `WithEgressSpoolPath` persists signed envelopes that could not be delivered
+  so they are retried after a restart. The spool holds one canonical envelope
+  per line and is bounded at 8 MiB, oldest envelopes dropped.
+
+Batches are signed with the account's app key and must match the frozen
+cross-language wire contract (canonical compact JSON, `tessera-egress-v1:`
+Ed25519 preimage, `ed25519:<hex>` identity/signature); see
+`docs/egress-wire-golden.md` in the moneyd repo.
+
 ## Packed Uploads
 
 When uploading many small objects, `UploadPacked` combines them into shared

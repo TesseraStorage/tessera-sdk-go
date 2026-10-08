@@ -57,6 +57,9 @@ type mockHostClient struct {
 
 	readJitter func() time.Duration // set before issuing reads; nil for none
 
+	readHooksMu sync.Mutex
+	readHooks   map[types.PublicKey]func(ctx context.Context, w io.Writer, sector []byte) error
+
 	errHostsMu sync.Mutex
 	errHosts   map[types.PublicKey]hostErr
 
@@ -255,20 +258,40 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 	}
 
 	m.sectorsMu.Lock()
-	defer m.sectorsMu.Unlock()
-
 	sectors, ok := m.hostSectors[hostKey]
 	if !ok {
+		m.sectorsMu.Unlock()
 		return rhp.RPCReadSectorResult{}, errors.New("host not found")
 	}
 	sector, ok := sectors[sectorRoot]
 	if !ok {
+		m.sectorsMu.Unlock()
 		return rhp.RPCReadSectorResult{}, errors.New("sector not found")
 	}
-	if _, err := w.Write(sector[offset : offset+length]); err != nil {
+	// copy the region out so a completion hook below can run without the
+	// sector lock; hooks may block until the read context is cancelled, and
+	// holding the lock would stall every other read that must complete first.
+	region := append([]byte(nil), sector[offset:offset+length]...)
+	m.sectorsMu.Unlock()
+
+	if hook := m.readCompletion(hostKey); hook != nil {
+		if err := hook(ctx, w, region); err != nil {
+			return rhp.RPCReadSectorResult{}, err
+		}
+		return rhp.RPCReadSectorResult{}, nil
+	}
+
+	if _, err := w.Write(region); err != nil {
 		return rhp.RPCReadSectorResult{}, err
 	}
 	return rhp.RPCReadSectorResult{}, nil
+}
+
+// readCompletion returns the completion hook installed for hostKey, if any.
+func (m *mockHostClient) readCompletion(hostKey types.PublicKey) func(ctx context.Context, w io.Writer, sector []byte) error {
+	m.readHooksMu.Lock()
+	defer m.readHooksMu.Unlock()
+	return m.readHooks[hostKey]
 }
 
 // Prices implements the [hostClient] interface.
@@ -374,6 +397,24 @@ func (m *mockHostClient) SetSectorReadDelay(root types.Hash256, d time.Duration)
 	m.sectorDelays[root] = d
 }
 
+// SetReadCompletion overrides how the given host's sector reads finish: after
+// the mock's delays resolve the sector, ReadSector calls hook(ctx, w, sector)
+// with the requested region and lets the hook decide how much of it to write
+// and what error to return (nil means success). A nil hook restores the
+// default behavior (write the whole region, succeed). The hook runs without
+// the mock's sector lock, so it may block on ctx -- tests use it to model a
+// read that is served only after the chunk completed and cancelled it, or an
+// RPC aborted mid-write with partial bytes already in the caller's buffer.
+func (m *mockHostClient) SetReadCompletion(hostKey types.PublicKey, hook func(ctx context.Context, w io.Writer, sector []byte) error) {
+	m.readHooksMu.Lock()
+	defer m.readHooksMu.Unlock()
+	if hook == nil {
+		delete(m.readHooks, hostKey)
+		return
+	}
+	m.readHooks[hostKey] = hook
+}
+
 // SetErrHosts marks the first n hosts as failing: each will return
 // the given error for its first failCount write attempts.
 func (m *mockHostClient) SetErrHosts(tb testing.TB, n, failCount int, err error) {
@@ -403,6 +444,7 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 		provider:     client.NewProvider(hosts),
 		slowHosts:    make(map[types.PublicKey]time.Duration),
 		sectorDelays: make(map[types.Hash256]time.Duration),
+		readHooks:    make(map[types.PublicKey]func(ctx context.Context, w io.Writer, sector []byte) error),
 		errHosts:     make(map[types.PublicKey]hostErr),
 		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
 		writeCalls:   make(map[types.PublicKey]int),
@@ -665,15 +707,19 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, opts 
 // egressCapture is the offline transport seam for egress tests: it records
 // every envelope the reporter posts and returns scripted errors.
 type egressCapture struct {
-	mu       sync.Mutex
-	attempts [][]byte
-	errors   []error
+	mu        sync.Mutex
+	attempts  [][]byte
+	errors    []error
+	failEvery error
 }
 
 func (c *egressCapture) post(_ context.Context, envelope []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attempts = append(c.attempts, append([]byte(nil), envelope...))
+	if c.failEvery != nil {
+		return c.failEvery
+	}
 	if len(c.errors) == 0 {
 		return nil
 	}
@@ -687,6 +733,21 @@ func (c *egressCapture) failNext(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.errors = append(c.errors, err)
+}
+
+// failAll makes every post attempt return err until succeedAll is called.
+func (c *egressCapture) failAll(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failEvery = err
+	c.errors = nil
+}
+
+// succeedAll restores successful posts after failAll.
+func (c *egressCapture) succeedAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failEvery = nil
 }
 
 // bodies returns a copy of every envelope posted so far.
@@ -754,8 +815,10 @@ func newMockBuilder(app appClient, hosts hostClient, hostStore *hostCache) *Buil
 	}
 }
 
-// newTestSDK creates an SDK with mock clients for testing.
-func newTestSDK(t testing.TB, hosts int, log *zap.Logger) (*SDK, *mockHostClient) {
+// newTestSDK creates an SDK with mock clients for testing. Options are applied
+// after the logger, so egress tests can enable reporting and route sends
+// through a capture.
+func newTestSDK(t testing.TB, hosts int, log *zap.Logger, opts ...Option) (*SDK, *mockHostClient) {
 	t.Helper()
 
 	appKey := types.GeneratePrivateKey()
@@ -764,7 +827,7 @@ func newTestSDK(t testing.TB, hosts int, log *zap.Logger) (*SDK, *mockHostClient
 	hostClient := newMockHostClient(hostStore)
 
 	b := newMockBuilder(appClient, hostClient, hostStore)
-	sdk, err := b.SDK(appKey, WithLogger(log))
+	sdk, err := b.SDK(appKey, append([]Option{WithLogger(log)}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}

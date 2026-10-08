@@ -233,6 +233,15 @@ func (s *SDK) downloadSlab(ctx context.Context, hc hostClient, slab slabs.SlabSl
 			buf := bytes.NewBuffer(make([]byte, 0, length))
 			start := time.Now()
 			_, err := hc.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
+			// report the served shard immediately, before the result can be
+			// dropped by the cancellation race below: the host did the work,
+			// so an overprovisioned success that loses the race still counts.
+			// Failed, cancelled and partially written reads are not reported,
+			// and slabs.SlabSlice carries no id, so slab_id is null on the
+			// wire. record never blocks or fails the read.
+			if err == nil {
+				s.egress.record(d.sector.HostKey, nil, d.index, buf.Len())
+			}
 			elapsed := time.Since(start)
 			// a read aborted because the chunk already had enough shards
 			// measured the cancellation, not the network, so it is not a

@@ -52,6 +52,14 @@ const (
 	defaultEgressInterval = 30 * time.Second
 	defaultEgressBatchMax = 500
 
+	// egressBatchMaxEvents and egressBatchMaxBytes are the client obligations
+	// from the wire contract: at most 1000 events and 512 MiB of cumulative
+	// event bytes per envelope (the server rejects batches above 1000 events
+	// or 1 GiB). WithEgressBatchMax clamps to egressBatchMaxEvents and
+	// takeEvents stops at egressBatchMaxBytes.
+	egressBatchMaxEvents = 1000
+	egressBatchMaxBytes  = 512 << 20 // 512 MiB
+
 	// egressRetryBase and egressRetryMax bound the exponential retry backoff
 	// (1s -> 60s cap).
 	egressRetryBase = time.Second
@@ -163,13 +171,16 @@ func defaultEgressConfig() egressConfig {
 }
 
 // newEgressReporter builds a reporter. Non-positive interval or batchMax
-// values fall back to the defaults.
+// values fall back to the defaults; batchMax above the server's 1000-event
+// limit is clamped to it.
 func newEgressReporter(cfg egressConfig, appKey types.PrivateKey, log *zap.Logger) *egressReporter {
 	if cfg.interval <= 0 {
 		cfg.interval = defaultEgressInterval
 	}
 	if cfg.batchMax < 1 {
 		cfg.batchMax = defaultEgressBatchMax
+	} else if cfg.batchMax > egressBatchMaxEvents {
+		cfg.batchMax = egressBatchMaxEvents
 	}
 	if log == nil {
 		log = zap.NewNop()
@@ -453,7 +464,11 @@ func (r *egressReporter) queueLen() int {
 	return len(r.queue)
 }
 
-// takeEvents removes and returns up to max of the oldest queued events.
+// takeEvents removes and returns up to max of the oldest queued events,
+// stopping before an event that would push the cumulative bytes past
+// egressBatchMaxBytes (the 512 MiB client obligation). It always takes at
+// least one event when the queue is non-empty: the server rejects empty
+// batches.
 func (r *egressReporter) takeEvents(max int) []egressEvent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -461,9 +476,19 @@ func (r *egressReporter) takeEvents(max int) []egressEvent {
 	if n == 0 {
 		return nil
 	}
-	events := make([]egressEvent, n)
-	copy(events, r.queue[:n])
-	r.queue = r.queue[n:]
+	taken := 0
+	var total int64
+	for taken < n {
+		eventBytes := int64(r.queue[taken].bytes)
+		if taken > 0 && total+eventBytes > egressBatchMaxBytes {
+			break
+		}
+		total += eventBytes
+		taken++
+	}
+	events := make([]egressEvent, taken)
+	copy(events, r.queue[:taken])
+	r.queue = r.queue[taken:]
 	if len(r.queue) == 0 {
 		r.queue = nil
 	}

@@ -1304,9 +1304,13 @@ func WithEgressInterval(interval time.Duration) Option {
 }
 
 // WithEgressBatchMax sets the number of queued egress events that triggers an
-// immediate flush. The default is 500.
+// immediate flush. The default is 500. Values above 1000 are clamped to 1000,
+// the server's per-batch event limit.
 func WithEgressBatchMax(max int) Option {
 	return func(s *SDK) {
+		if max > egressBatchMaxEvents {
+			max = egressBatchMaxEvents
+		}
 		s.egressCfg.batchMax = max
 	}
 }

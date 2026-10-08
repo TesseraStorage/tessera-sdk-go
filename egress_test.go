@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -364,6 +365,73 @@ func TestEgressOverflowDropsOldest(t *testing.T) {
 	}
 	if last := queued[len(queued)-1]; last.shardIndex != egressQueueCap {
 		t.Fatalf("back shard index = %d, want %d", last.shardIndex, egressQueueCap)
+	}
+}
+
+// TestEgressBatchMaxClampedToServerLimit verifies WithEgressBatchMax clamps
+// the configured batch size to the server's 1000-event limit.
+func TestEgressBatchMaxClampedToServerLimit(t *testing.T) {
+	sdk, _ := newEgressTestSDK(t, WithEgressBatchMax(5000))
+	defer sdk.Close()
+
+	if sdk.egressCfg.batchMax != egressBatchMaxEvents {
+		t.Fatalf("configured batchMax = %d, want %d (clamped to the server limit)",
+			sdk.egressCfg.batchMax, egressBatchMaxEvents)
+	}
+	if sdk.egress.batchMax != egressBatchMaxEvents {
+		t.Fatalf("reporter batchMax = %d, want %d (clamped to the server limit)",
+			sdk.egress.batchMax, egressBatchMaxEvents)
+	}
+}
+
+// TestEgressBatchByteCap verifies a byte-heavy queue yields an envelope with
+// at least one event whose cumulative bytes stay within the 512 MiB client
+// obligation, satisfying the server's validate_batch bounds.
+func TestEgressBatchByteCap(t *testing.T) {
+	sdk, capture := newEgressTestSDK(t,
+		WithEgressInterval(time.Hour),
+		WithEgressBatchMax(5000)) // clamped to the 1000-event server limit
+	defer sdk.Close()
+
+	const eventBytes = egressBatchMaxBytes / 4 // 128 MiB
+	for i := 0; i < 6; i++ {
+		sdk.egress.record(types.PublicKey{byte(i)}, nil, i, eventBytes)
+	}
+	sdk.egress.flushNow()
+
+	bodies := capture.bodies()
+	if len(bodies) != 1 {
+		t.Fatalf("flushNow sent %d envelopes, want 1", len(bodies))
+	}
+	value := verifyEgressEnvelope(t, sdk.AppKey(), bodies[0])
+	events, ok := value["events"].([]any)
+	if !ok || len(events) == 0 {
+		t.Fatalf("events = %v, want at least one event", value["events"])
+	}
+	if len(events) > egressBatchMaxEvents {
+		t.Fatalf("envelope has %d events, above the %d-event server limit",
+			len(events), egressBatchMaxEvents)
+	}
+	if len(events) != 4 {
+		t.Fatalf("envelope has %d events, want 4 (512 MiB / 128 MiB)", len(events))
+	}
+	var total int64
+	for _, event := range events {
+		bytes, err := event.(map[string]any)["bytes"].(json.Number).Int64()
+		if err != nil {
+			t.Fatalf("event bytes is not an integer: %v", err)
+		}
+		total += bytes
+	}
+	if total > egressBatchMaxBytes {
+		t.Fatalf("cumulative event bytes = %d, above the client cap %d", total, egressBatchMaxBytes)
+	}
+	if total != egressBatchMaxBytes {
+		t.Fatalf("cumulative event bytes = %d, want %d", total, egressBatchMaxBytes)
+	}
+	totals, ok := value["totals"].(map[string]any)
+	if !ok || totals["bytes"] != json.Number(strconv.Itoa(egressBatchMaxBytes)) {
+		t.Fatalf("totals = %v, want bytes %d", value["totals"], egressBatchMaxBytes)
 	}
 }
 

@@ -112,7 +112,10 @@ if err != nil {
 
 - `WithEgressURL` enables reporting. `WithEgressInterval` bounds how long a
   queued event waits before it is flushed, and `WithEgressBatchMax` flushes
-  immediately once that many events are queued.
+  immediately once that many events are queued; values above 1000 are clamped
+  to 1000, the server's per-batch event limit. A batch also stops taking
+  events once its cumulative bytes reach 512 MiB, well under the server's
+  1 GiB cap.
 - Recording is a cheap in-memory append: reads never block on the reporter and
   a failed report never fails a read. The queue is bounded (oldest events
   dropped); failed sends retry the identical signed envelope with exponential

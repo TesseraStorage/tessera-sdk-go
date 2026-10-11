@@ -17,7 +17,7 @@ import (
 	"go.sia.tech/coreutils/rhp/v4"
 	"go.sia.tech/coreutils/threadgroup"
 	"go.sia.tech/indexd/api"
-	"go.sia.tech/indexd/api/app"
+	"go.sia.tech/indexd/api/appclient"
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
@@ -67,7 +67,7 @@ type (
 
 	// An appClient is an interface for the application API of the indexer.
 	appClient interface {
-		Account(ctx context.Context, appKey types.PrivateKey) (resp app.AccountResponse, err error)
+		Account(ctx context.Context, appKey types.PrivateKey) (resp appclient.AccountResponse, err error)
 
 		Hosts(context.Context, types.PrivateKey, ...api.URLQueryParameterOption) ([]hosts.HostInfo, error)
 
@@ -359,7 +359,7 @@ func (s *SDK) AppKey() types.PrivateKey {
 }
 
 // Account retrieves account information for the current app key.
-func (s *SDK) Account(ctx context.Context) (app.AccountResponse, error) {
+func (s *SDK) Account(ctx context.Context) (appclient.AccountResponse, error) {
 	return s.app.Account(ctx, s.appKey)
 }
 

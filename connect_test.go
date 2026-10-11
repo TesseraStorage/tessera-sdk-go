@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"go.sia.tech/indexd/accounts"
-	"go.sia.tech/indexd/api/app"
+	"go.sia.tech/indexd/api/appclient"
 	"go.sia.tech/indexd/slabs"
 	"go.sia.tech/indexd/testutils"
 	"go.sia.tech/siastorage"
@@ -18,7 +18,7 @@ import (
 func respondToAppConnection(t *testing.T, responseURL string, connectKey string, approve bool) {
 	t.Helper()
 
-	buf, err := json.Marshal(app.ApproveAppRequest{
+	buf, err := json.Marshal(appclient.ApproveAppRequest{
 		Approve: approve,
 	})
 	if err != nil {

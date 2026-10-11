@@ -18,7 +18,7 @@ import (
 	"go.sia.tech/core/types"
 	"go.sia.tech/coreutils/rhp/v4"
 	"go.sia.tech/indexd/api"
-	"go.sia.tech/indexd/api/app"
+	"go.sia.tech/indexd/api/appclient"
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
@@ -476,8 +476,8 @@ func newMockAppClient(hosts *hostCache) *mockAppClient {
 }
 
 // Account implements the [appClient] interface.
-func (mc *mockAppClient) Account(_ context.Context, _ types.PrivateKey) (resp app.AccountResponse, err error) {
-	return app.AccountResponse{}, nil
+func (mc *mockAppClient) Account(_ context.Context, _ types.PrivateKey) (resp appclient.AccountResponse, err error) {
+	return appclient.AccountResponse{}, nil
 }
 
 // PinSlabs implements the [appClient] interface.

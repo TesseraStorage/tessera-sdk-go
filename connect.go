@@ -10,7 +10,7 @@ import (
 	"go.sia.tech/core/types"
 	"go.sia.tech/coreutils/threadgroup"
 	"go.sia.tech/coreutils/wallet"
-	"go.sia.tech/indexd/api/app"
+	"go.sia.tech/indexd/api/appclient"
 	"go.sia.tech/indexd/keys"
 	"go.uber.org/zap"
 	"lukechampine.com/frand"
@@ -40,7 +40,7 @@ var (
 
 	// ErrUserRejected is returned by [Builder.WaitForApproval] when
 	// the user rejects the connection request.
-	ErrUserRejected = app.ErrUserRejected
+	ErrUserRejected = appclient.ErrUserRejected
 )
 
 type (
@@ -73,10 +73,10 @@ type (
 // on the same Builder return [ErrBuilderConsumed].
 type Builder struct {
 	ephemeralKey types.PrivateKey
-	client       *app.Client
+	client       *appclient.Client
 
-	info         app.Info
-	registerResp *app.RegisterAppResponse
+	info         appclient.Info
+	registerResp *appclient.RegisterAppResponse
 	sharedSecret types.Hash256
 
 	consumed *atomic.Bool
@@ -272,7 +272,7 @@ func deriveAppKey(mnemonic string, appID types.Hash256, sharedSecret types.Hash2
 func NewBuilder(indexerURL string, metadata AppMetadata) *Builder {
 	return &Builder{
 		ephemeralKey: types.GeneratePrivateKey(),
-		info: app.Info{
+		info: appclient.Info{
 			AppID:       metadata.ID,
 			Name:        metadata.Name,
 			Description: metadata.Description,
@@ -280,7 +280,7 @@ func NewBuilder(indexerURL string, metadata AppMetadata) *Builder {
 			ServiceURL:  metadata.ServiceURL,
 			CallbackURL: metadata.CallbackURL,
 		},
-		client:   app.NewClient(indexerURL),
+		client:   appclient.NewClient(indexerURL),
 		consumed: &atomic.Bool{},
 	}
 }

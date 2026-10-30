@@ -1,24 +1,20 @@
 package siastorage
 
-// Merge-precondition proof for egress reporting (P3b): with no egress endpoint
-// configured, an SDK must be completely inert -- no HTTP request, no spool
-// file, no reporter or background goroutine -- while a full mock
-// upload/download cycle still succeeds with byte-identical results.
+// Egress reporting has been removed from this SDK fork entirely (see
+// egress.go): there is no option, type, config field, or internal hook left
+// anywhere in the package that could build or send a read/egress report.
 //
-// The mock seams (Builder.mockApp/mockHost through newTestSDK) keep every app
-// and host RPC in memory. Any HTTP request at all would therefore have to come
-// from the SDK itself, and the egress reporter builds its http.Client with a
-// nil Transport, which falls back to http.DefaultTransport at request time.
-// Swapping http.DefaultTransport for a counting, always-failing transport for
-// the duration of the test turns both facts into a tripwire: egress traffic is
-// counted, and nothing can silently reach the real network.
+// TestNoEgressCapabilityExists keeps the one assertion from the old
+// "reporting is off by default" test that is still meaningful once the whole
+// feature is gone: a complete mock upload/download cycle makes zero HTTP
+// requests and writes zero files, proving the capability cannot be
+// resurrected by any caller, not just that nobody happens to invoke it today.
 
 import (
 	"bytes"
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,7 +41,7 @@ func (c *countingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	c.mu.Lock()
 	c.urls = append(c.urls, req.Method+" "+req.URL.String())
 	c.mu.Unlock()
-	return nil, fmt.Errorf("unexpected HTTP request with egress reporting unconfigured: %s %s", req.Method, req.URL)
+	return nil, fmt.Errorf("unexpected HTTP request from the SDK: %s %s", req.Method, req.URL)
 }
 
 // installCountingTransport swaps http.DefaultTransport for the duration of the
@@ -66,7 +62,7 @@ func (c *countingTransport) assertZero(t *testing.T) {
 		c.mu.Lock()
 		urls := append([]string(nil), c.urls...)
 		c.mu.Unlock()
-		t.Fatalf("%d HTTP request(s) issued with egress reporting unconfigured: %v", n, urls)
+		t.Fatalf("%d HTTP request(s) issued; the SDK must never call out over HTTP: %v", n, urls)
 	}
 }
 
@@ -86,16 +82,27 @@ func assertDirEmpty(t *testing.T, dir string) {
 	}
 }
 
-// runMockUploadDownloadCycle writes a fixture through the complete mock write
-// path (Upload) and reads it back through the complete mock read path
-// (Download), asserting the returned content is byte-identical to what was
-// uploaded. The same shape is used by the existing mock network tests.
-func runMockUploadDownloadCycle(t *testing.T, sdk *SDK, host *mockHostClient) []byte {
-	t.Helper()
-	data := frand.Bytes(int(proto.SectorSize) * 10)
+// TestNoEgressCapabilityExists builds an SDK with only the mock seams and
+// proves that a complete mock upload/download cycle:
+//   - makes no HTTP request at all (http.DefaultTransport is a counting,
+//     failing transport for the whole test, so any request at all -- egress
+//     or otherwise -- is caught),
+//   - writes no file (a t.TempDir is also installed as TMPDIR and must
+//     remain empty),
+//   - returns exactly the uploaded fixture bytes, i.e. behaves normally.
+func TestNoEgressCapabilityExists(t *testing.T) {
+	ct := installCountingTransport(t)
+
+	// any implicit temporary file would land here and stay visible
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	sdk, host := newTestSDK(t, 20, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(int(proto.SectorSize) * 3)
 	obj := NewEmptyObject()
-	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data),
-		WithRedundancy(egressReadDataShards, egressReadParityShards)); err != nil {
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(4, 11)); err != nil {
 		t.Fatalf("upload failed: %v", err)
 	}
 	host.waitInflightDrained(t)
@@ -110,78 +117,17 @@ func runMockUploadDownloadCycle(t *testing.T, sdk *SDK, host *mockHostClient) []
 		t.Fatal("download content differs from the uploaded fixture")
 	}
 	host.waitInflightDrained(t)
-	return data
+
+	ct.assertZero(t)
+	assertDirEmpty(t, tmp)
 }
 
-// TestEgressDisabledIsInert builds an SDK with only the mock seams and no
-// egress options, then proves that a complete mock upload/download cycle:
-//
-//   - makes no HTTP request at all (http.DefaultTransport is a counting,
-//     failing transport for the whole test; egress uses a nil-Transport
-//     http.Client, so a reporter that wrongly started would be caught),
-//   - creates no reporter (sdk.egress stays nil) and writes no spool file
-//     (a t.TempDir is also installed as TMPDIR and must remain empty),
-//   - returns exactly the uploaded fixture bytes, i.e. behaves normally.
-//
-// A second case sets only WithEgressSpoolPath (still no URL, so reporting is
-// not configured): the configured spool must never be created either.
-func TestEgressDisabledIsInert(t *testing.T) {
-	t.Run("NoEgressOptions", func(t *testing.T) {
-		ct := installCountingTransport(t)
-
-		// any implicit temporary file would land here and stay visible
-		tmp := t.TempDir()
-		t.Setenv("TMPDIR", tmp)
-
-		sdk, host := newTestSDK(t, egressReadTotalShards, zaptest.NewLogger(t))
-		defer sdk.Close()
-
-		if sdk.egress != nil {
-			t.Fatal("egress reporter exists without WithEgressURL")
-		}
-		if sdk.egressCfg.url != "" || sdk.egressCfg.spoolPath != "" || sdk.egressCfg.post != nil {
-			t.Fatalf("unexpected egress config: %+v", sdk.egressCfg)
-		}
-
-		runMockUploadDownloadCycle(t, sdk, host)
-
-		ct.assertZero(t)
-		if sdk.egress != nil {
-			t.Fatal("egress reporter appeared after a completed cycle")
-		}
-		assertDirEmpty(t, tmp)
-	})
-
-	t.Run("SpoolPathWithoutURL", func(t *testing.T) {
-		ct := installCountingTransport(t)
-
-		dir := t.TempDir()
-		spool := filepath.Join(dir, "egress.spool")
-
-		// A spool path without an endpoint is not "reporting configured":
-		// initEgress must ignore it and the file must never be created.
-		sdk, host := newTestSDK(t, egressReadTotalShards, zaptest.NewLogger(t),
-			WithEgressSpoolPath(spool))
-		defer sdk.Close()
-
-		if sdk.egress != nil {
-			t.Fatal("egress reporter exists without WithEgressURL")
-		}
-
-		runMockUploadDownloadCycle(t, sdk, host)
-
-		ct.assertZero(t)
-		assertDirEmpty(t, dir)
-	})
-}
-
-// TestEgressDisabledWithHostClientDecorator proves the fork's WithHostClient
-// seam (covered in isolation by TestWithHostClientSeam) is still applied by
-// the production constructor on an SDK built without egress options, and that
-// decorated calls succeed. It exercises both clients that construction wraps:
-// the write-path sdk.hosts and the per-object job-scoped client Download uses
-// (newHosts).
-func TestEgressDisabledWithHostClientDecorator(t *testing.T) {
+// TestWithHostClientDecorator proves the fork's WithHostClient seam (covered
+// in isolation by TestWithHostClientSeam) is still applied by the production
+// constructor, and that decorated calls succeed. It exercises both clients
+// that construction wraps: the write-path sdk.hosts and the per-object
+// job-scoped client Download uses (newHosts).
+func TestWithHostClientDecorator(t *testing.T) {
 	appKey := types.GeneratePrivateKey()
 	hostStore := newMockHostStore(1)
 	appMock := newMockAppClient(hostStore)
@@ -197,9 +143,6 @@ func TestEgressDisabledWithHostClientDecorator(t *testing.T) {
 	}
 	defer sdk.Close()
 
-	if sdk.egress != nil {
-		t.Fatal("egress reporter exists without WithEgressURL")
-	}
 	sdk.hostsCache.updateHosts([]hosts.HostInfo{{PublicKey: hk, GoodForUpload: true}})
 
 	// write path: the decorator observes a successful pick/release, and a

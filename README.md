@@ -95,39 +95,13 @@ the sealed object (via `obj.Seal(appKey)`) so it can be reopened later.
 
 ## Egress Reporting
 
-Downloads can report served-shard egress to a Tessera moneyd endpoint so the
-account's usage and allowance are metered server-side. Reporting is opt-in and
-stays disabled until `WithEgressURL` is set; without it nothing is recorded.
-
-```go
-client, err := builder.SDK(appKey,
-	siastorage.WithEgressURL("https://tessera.storage/api/v1/usage/egress"),
-	siastorage.WithEgressInterval(30*time.Second), // default: how long an event may wait
-	siastorage.WithEgressBatchMax(500),            // default: events per batch
-	siastorage.WithEgressSpoolPath("/var/lib/myapp/egress.spool")) // default: disabled
-if err != nil {
-	log.Fatal("failed to create SDK:", err)
-}
-```
-
-- `WithEgressURL` enables reporting. `WithEgressInterval` bounds how long a
-  queued event waits before it is flushed, and `WithEgressBatchMax` flushes
-  immediately once that many events are queued; values above 1000 are clamped
-  to 1000, the server's per-batch event limit. A batch also stops taking
-  events once its cumulative bytes reach 512 MiB, well under the server's
-  1 GiB cap.
-- Recording is a cheap in-memory append: reads never block on the reporter and
-  a failed report never fails a read. The queue is bounded (oldest events
-  dropped); failed sends retry the identical signed envelope with exponential
-  backoff (1s to 60s), and non-retryable responses are dropped with a log line.
-- `WithEgressSpoolPath` persists signed envelopes that could not be delivered
-  so they are retried after a restart. The spool holds one canonical envelope
-  per line and is bounded at 8 MiB, oldest envelopes dropped.
-
-Batches are signed with the account's app key and must match the frozen
-cross-language wire contract (canonical compact JSON, `tessera-egress-v1:`
-Ed25519 preimage, `ed25519:<hex>` identity/signature); see
-`docs/egress-wire-golden.md` in the moneyd repo.
+Removed. No
+T-SDK posts a client-asserted read/egress report. The server's residual meter
+(balance-drop measurement) is the only read evidence trusted for billing; a
+client-reported byte count was never billed from and could not be trusted
+anyway, since an agent controlling the SDK can alter whatever it reports.
+`WithEgressURL`, `WithEgressInterval`, `WithEgressBatchMax`, and
+`WithEgressSpoolPath` no longer exist.
 
 ## Packed Uploads
 

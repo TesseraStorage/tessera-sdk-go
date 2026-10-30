@@ -141,13 +141,6 @@ type (
 
 		appKey types.PrivateKey
 
-		// egress reports successfully served shard reads to the configured
-		// endpoint; nil when no egress URL is configured (reporting off).
-		egress *egressReporter
-		// egressCfg collects the egress options until initEgress builds the
-		// reporter.
-		egressCfg egressConfig
-
 		tg  *threadgroup.ThreadGroup
 		log *zap.Logger
 	}
@@ -233,15 +226,6 @@ func (s *SDK) downloadSlab(ctx context.Context, hc hostClient, slab slabs.SlabSl
 			buf := bytes.NewBuffer(make([]byte, 0, length))
 			start := time.Now()
 			_, err := hc.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
-			// report the served shard immediately, before the result can be
-			// dropped by the cancellation race below: the host did the work,
-			// so an overprovisioned success that loses the race still counts.
-			// Failed, cancelled and partially written reads are not reported,
-			// and slabs.SlabSlice carries no id, so slab_id is null on the
-			// wire. record never blocks or fails the read.
-			if err == nil {
-				s.egress.record(d.sector.HostKey, nil, d.index, buf.Len())
-			}
 			elapsed := time.Since(start)
 			// a read aborted because the chunk already had enough shards
 			// measured the cancellation, not the network, so it is not a
@@ -1285,52 +1269,11 @@ func WithLogger(log *zap.Logger) Option {
 	}
 }
 
-// WithEgressURL enables signed egress reporting to the given endpoint, e.g.
-// "http://indexer/api/v1/usage/egress". Reporting is disabled by default;
-// without a URL no reporter is started and serving a shard does not record
-// anything.
-func WithEgressURL(url string) Option {
-	return func(s *SDK) {
-		s.egressCfg.url = url
-	}
-}
-
-// WithEgressInterval sets how long queued egress events may wait before they
-// are reported. The default is 30 seconds.
-func WithEgressInterval(interval time.Duration) Option {
-	return func(s *SDK) {
-		s.egressCfg.interval = interval
-	}
-}
-
-// WithEgressBatchMax sets the number of queued egress events that triggers an
-// immediate flush. The default is 500. Values above 1000 are clamped to 1000,
-// the server's per-batch event limit.
-func WithEgressBatchMax(max int) Option {
-	return func(s *SDK) {
-		if max > egressBatchMaxEvents {
-			max = egressBatchMaxEvents
-		}
-		s.egressCfg.batchMax = max
-	}
-}
-
-// WithEgressSpoolPath sets a file used to spool signed egress envelopes that
-// could not be delivered, so they survive process restarts. The spool holds
-// one canonical envelope per line and is bounded at 8 MiB, oldest dropped.
-// Empty (the default) disables the spool.
-func WithEgressSpoolPath(path string) Option {
-	return func(s *SDK) {
-		s.egressCfg.spoolPath = path
-	}
-}
-
 func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, error) {
 	sdk := &SDK{
 		appKey:     appKey,
 		app:        app,
 		hostsCache: newHostCache(),
-		egressCfg:  defaultEgressConfig(),
 
 		tg:  threadgroup.New(),
 		log: zap.NewNop(), // no logging by default
@@ -1375,8 +1318,5 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 	// instead). See SDK.Upload and SDK.Download for where each half of this
 	// law now lives.
 
-	// start egress reporting if WithEgressURL configured it (this must run
-	// after every Option has been applied)
-	sdk.initEgress()
 	return sdk, nil
 }

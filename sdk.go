@@ -17,7 +17,7 @@ import (
 	"go.sia.tech/coreutils/rhp/v4"
 	"go.sia.tech/coreutils/threadgroup"
 	"go.sia.tech/indexd/api"
-	"go.sia.tech/indexd/api/appclient"
+	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
@@ -30,20 +30,12 @@ import (
 const pinBatchSize = 50
 
 type (
-	// A HostClient is an interface for interacting with hosts.
+	// A HostClient talks to storage hosts.
 	//
-	// EXPORTED (Tessera fork). The stock SDK keeps this unexported with no public setter, so an
-	// integrator cannot observe the host transport. Two events that exist inside this interface
-	// are unavailable anywhere else in the public API:
-	//
-	//	PickWrite     -- a host has been selected and a shard write is ABOUT TO START on it
-	//	AddFailedRPC  -- a host's RPC FAILED
-	//
-	// WithUploadProgress cannot substitute for either: ShardProgress "reports the result of a
-	// successfully completed shard upload" (sdk.go), fires once per shard, and names only the
-	// winner. A host that was picked, failed, and was swapped out by pool.swap() leaves NO trace
-	// in the public API at all -- so per-host failure attribution and any "write in flight"
-	// indication are both impossible without this seam.
+	// PickWrite reports that a shard write is about to start on a chosen host.
+	// AddFailedRPC reports that a host RPC failed. Upload progress does not
+	// include either event: it fires once per successful shard and names only
+	// the host that finished it.
 	HostClient interface {
 		Prices(ctx context.Context, hostKey types.PublicKey) (prices proto4.HostPrices, err error)
 		ReadSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
@@ -59,24 +51,18 @@ type (
 		Close() error
 	}
 
-	// hostClient is retained as an alias so every existing use inside the package -- including
-	// connect.go's mockHost field and the test suite -- compiles unchanged. Renaming call sites
-	// would turn an additive change into a sweeping one, which is exactly what makes a fork hard
-	// to rebase and hard to propose upstream.
+	// hostClient is the in-package name for HostClient.
 	hostClient = HostClient
 
 	// An appClient is an interface for the application API of the indexer.
 	appClient interface {
-		Account(ctx context.Context, appKey types.PrivateKey) (resp appclient.AccountResponse, err error)
+		Account(ctx context.Context, appKey types.PrivateKey) (resp app.AccountResponse, err error)
 
 		Hosts(context.Context, types.PrivateKey, ...api.URLQueryParameterOption) ([]hosts.HostInfo, error)
 
-		// ObjectHosts returns the current, post-repair set of hosts storing
-		// the given object's shards -- indexd's `GET /objects/:key/hosts`.
-		//
-		// TESSERA FORK: backs
-		// [SDK.Download]'s job-scoped, read-start-only host map. Product
-		// law: downloads never call the write-path Hosts/GET /hosts.
+		// ObjectHosts returns the hosts storing the object's shards
+		// (GET /objects/:key/hosts), including hosts that are not currently
+		// usable for new uploads. Downloads call this instead of Hosts.
 		ObjectHosts(ctx context.Context, appKey types.PrivateKey, key types.Hash256) ([]hosts.HostInfo, error)
 
 		CreateSharedObjectURL(ctx context.Context, appKey types.PrivateKey, objectID types.Hash256, encryptionKey []byte, validUntil time.Time) (string, error)
@@ -127,26 +113,12 @@ type (
 		wrapHosts  func(HostClient) HostClient
 		hostsCache *hostCache
 
-		// newHosts builds a hostClient over a given host store. Production
-		// code always builds a real client.New(client.NewProvider(store), ...);
-		// mocked SDKs override this to hand back the same mock client
-		// regardless of store, so a download's job-scoped map still exercises
-		// the mock's recorded RPC behavior.
-		//
-		// TESSERA FORK: lets
-		// [SDK.Download] build a fresh, job-scoped hostClient over a
-		// download-only host store, isolated from the shared write-path
-		// hostsCache.
+		// newHosts builds a host client over a host store. Production builds a
+		// real client. Tests override it so every download uses the same mock,
+		// which records RPCs by public key rather than by store.
 		newHosts func(*hostCache) hostClient
 
 		appKey types.PrivateKey
-
-		// egress reports successfully served shard reads to the configured
-		// endpoint; nil when no egress URL is configured (reporting off).
-		egress *egressReporter
-		// egressCfg collects the egress options until initEgress builds the
-		// reporter.
-		egressCfg egressConfig
 
 		tg  *threadgroup.ThreadGroup
 		log *zap.Logger
@@ -233,15 +205,6 @@ func (s *SDK) downloadSlab(ctx context.Context, hc hostClient, slab slabs.SlabSl
 			buf := bytes.NewBuffer(make([]byte, 0, length))
 			start := time.Now()
 			_, err := hc.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
-			// report the served shard immediately, before the result can be
-			// dropped by the cancellation race below: the host did the work,
-			// so an overprovisioned success that loses the race still counts.
-			// Failed, cancelled and partially written reads are not reported,
-			// and slabs.SlabSlice carries no id, so slab_id is null on the
-			// wire. record never blocks or fails the read.
-			if err == nil {
-				s.egress.record(d.sector.HostKey, nil, d.index, buf.Len())
-			}
 			elapsed := time.Since(start)
 			// a read aborted because the chunk already had enough shards
 			// measured the cancellation, not the network, so it is not a
@@ -359,7 +322,7 @@ func (s *SDK) AppKey() types.PrivateKey {
 }
 
 // Account retrieves account information for the current app key.
-func (s *SDK) Account(ctx context.Context) (appclient.AccountResponse, error) {
+func (s *SDK) Account(ctx context.Context) (app.AccountResponse, error) {
 	return s.app.Account(ctx, s.appKey)
 }
 
@@ -384,11 +347,9 @@ func (s *SDK) DeleteObject(ctx context.Context, key types.Hash256) error {
 // After uploading the object, the caller must call PinObject to pin the
 // slabs and save the object metadata to the indexer.
 //
-// TESSERA FORK: fetches the write-path
-// host plate (GET /hosts, paginated) once, here, at write-job start. connect
-// no longer does this -- see initSDK -- and there is no periodic background
-// refresh; a long-lived SDK's write-path list is only as fresh as its last
-// Upload/UploadPacked call.
+// Upload fetches the write host list (GET /hosts) once, at the start of the
+// call. The SDK does not refresh that list on a timer, so it is only as new
+// as the last Upload or UploadPacked.
 func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -432,12 +393,10 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 // reader cancels the underlying download. Callers must always Close the
 // returned reader to release resources.
 //
-// TESSERA FORK: read start fetches THIS
-// object's map -- GET /objects/:key/hosts, via [appClient.ObjectHosts] --
-// once, into a fresh, job-scoped hostClient that shares no state with the
-// write-path SDK.hosts/hostsCache Upload populates. It is used for this
-// download only and closed when the returned reader is closed. Product law:
-// never call GET /hosts to help a download, never reuse the write-path plate.
+// Download fetches the hosts storing this object (GET /objects/:key/hosts)
+// once, into a host client used only for this download and closed when the
+// returned reader is closed. Downloads do not call GET /hosts and do not use
+// the host list Upload fills.
 func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
 	do, err := newDownloadOption(obj.Size(), opts...)
 	if err != nil {
@@ -469,16 +428,10 @@ func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error
 // data. Closing the reader cancels the underlying download. Callers must always
 // Close the returned reader to release resources.
 //
-// KNOWN GAP (TESSERA FORK): a shared object
-// belongs to a DIFFERENT account than s.appKey, so indexd's authenticated
-// GET /objects/:key/hosts (scoped to the caller's own account) cannot be used
-// here -- unlike [SDK.Download], this path still reads from the shared,
-// write-path s.hosts/hostsCache, which Upload/UploadPacked populate and
-// nothing else does since connect-time/periodic refresh were removed. A
-// process that only ever calls DownloadSharedObject (never Upload) now starts
-// with an EMPTY host cache. Out of scope for this packet (four laws are
-// specified for object()/download() of an app's own objects); flagged here
-// rather than silently left broken.
+// A shared object belongs to another account, so GET /objects/:key/hosts
+// (which returns only the caller's objects) is not used. This download reads
+// the SDK host cache that Upload and UploadPacked fill. A process that never
+// uploads starts that cache empty.
 func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts ...DownloadOption) (io.ReadCloser, error) {
 	obj, encryptionKey, err := s.app.SharedObject(ctx, sharedURL)
 	if err != nil {
@@ -856,7 +809,7 @@ type chunkDownloader struct {
 	ctx         context.Context
 	cancel      context.CancelCauseFunc
 	key         *[32]byte
-	hc          hostClient // job-scoped host client for this download only (TESSERA FORK)
+	hc          hostClient // host client for this download
 	hostTimeout time.Duration
 	onProgress  func(ShardProgress)
 	bufs        *chunkBufPool
@@ -1250,26 +1203,16 @@ func WithDownloadRange(offset, length uint64) DownloadOption {
 // An Option configures the SDK.
 type Option func(*SDK)
 
-// WithLogger sets the logger for the SDK. The default behavior is to not log
-// anything.
-// WithHostClient wraps the SDK's host transport, allowing an integrator to observe host-level
-// events that are otherwise invisible: a write starting on a specific host (PickWrite), a host RPC
-// failing (AddFailedRPC), and the release of a write slot.
+// WithHostClient wraps the SDK's host transport. The wrapper can observe a
+// write starting on a host (PickWrite), a failed host RPC (AddFailedRPC), and
+// the release of a write slot. Upload progress reports only successful shard
+// transfers and names only the host that finished each shard, so a host that
+// failed and was replaced does not appear there.
 //
-// The function receives the SDK's own fully-configured HostClient and must return a value that
-// delegates to it. Returning the argument unchanged is a no-op. It is applied after construction,
-// so a wrapper can observe how writes proceed but cannot change how hosts are reached.
-//
-// TESSERA FORK ADDITION. Rationale, for the upstream proposal:
-//
-//	WithUploadProgress reports only SUCCESSFUL, COMPLETED shard transfers and names only the host
-//	that won. upload.go's pool.swap() silently substitutes a failed host and reports the
-//	substitute's success, so from the public API a slow or failing host is INDISTINGUISHABLE FROM
-//	A HOST THAT WAS NEVER ASKED. That makes two legitimate integrator needs impossible:
-//	per-host reliability measurement, and any live "write in flight" indication.
-//
-//	The seam already exists internally (connect.go's mockHost field is this same interface), so
-//	this exposes an existing abstraction rather than introducing one.
+// fn receives the SDK's host client and must return a client that delegates
+// to it. Returning the argument unchanged leaves the transport as it is. The
+// wrapper is applied after the client is built, so it observes writes and
+// does not choose how hosts are reached.
 func WithHostClient(fn func(HostClient) HostClient) Option {
 	return func(s *SDK) {
 		if fn == nil {
@@ -1279,49 +1222,10 @@ func WithHostClient(fn func(HostClient) HostClient) Option {
 	}
 }
 
+// WithLogger sets the logger for the SDK. The default is to not log anything.
 func WithLogger(log *zap.Logger) Option {
 	return func(s *SDK) {
 		s.log = log
-	}
-}
-
-// WithEgressURL enables signed egress reporting to the given endpoint, e.g.
-// "http://indexer/api/v1/usage/egress". Reporting is disabled by default;
-// without a URL no reporter is started and serving a shard does not record
-// anything.
-func WithEgressURL(url string) Option {
-	return func(s *SDK) {
-		s.egressCfg.url = url
-	}
-}
-
-// WithEgressInterval sets how long queued egress events may wait before they
-// are reported. The default is 30 seconds.
-func WithEgressInterval(interval time.Duration) Option {
-	return func(s *SDK) {
-		s.egressCfg.interval = interval
-	}
-}
-
-// WithEgressBatchMax sets the number of queued egress events that triggers an
-// immediate flush. The default is 500. Values above 1000 are clamped to 1000,
-// the server's per-batch event limit.
-func WithEgressBatchMax(max int) Option {
-	return func(s *SDK) {
-		if max > egressBatchMaxEvents {
-			max = egressBatchMaxEvents
-		}
-		s.egressCfg.batchMax = max
-	}
-}
-
-// WithEgressSpoolPath sets a file used to spool signed egress envelopes that
-// could not be delivered, so they survive process restarts. The spool holds
-// one canonical envelope per line and is bounded at 8 MiB, oldest dropped.
-// Empty (the default) disables the spool.
-func WithEgressSpoolPath(path string) Option {
-	return func(s *SDK) {
-		s.egressCfg.spoolPath = path
 	}
 }
 
@@ -1330,7 +1234,6 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 		appKey:     appKey,
 		app:        app,
 		hostsCache: newHostCache(),
-		egressCfg:  defaultEgressConfig(),
 
 		tg:  threadgroup.New(),
 		log: zap.NewNop(), // no logging by default
@@ -1341,19 +1244,17 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 
 	// create the host client
 	sdk.hosts = client.New(client.NewProvider(sdk.hostsCache), sdk.log.Named("client"))
-	// Apply the WithHostClient decorator AFTER the real transport exists, so a wrapper always
-	// receives a fully-configured client and can only observe -- never replace -- how hosts are
-	// reached. (Tessera fork addition.)
+	// Apply WithHostClient after the transport exists, so the wrapper receives
+	// a fully configured client.
 	if sdk.wrapHosts != nil {
 		if wrapped := sdk.wrapHosts(sdk.hosts); wrapped != nil {
 			sdk.hosts = wrapped
 		}
 	}
 
-	// newHosts builds the job-scoped hostClient a Download call uses over its
-	// own per-object map. Defaults to a real client.New over the given store,
-	// decorated the same way as the write-path client above. (Tessera fork,
-	// Tessera fork)
+	// newHosts builds the host client Download uses for one object's hosts.
+	// It defaults to a real client over that store, wrapped the same way as
+	// the write client above.
 	if sdk.newHosts == nil {
 		sdk.newHosts = func(store *hostCache) hostClient {
 			hc := hostClient(client.New(client.NewProvider(store), sdk.log.Named("client")))
@@ -1366,17 +1267,9 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 		}
 	}
 
-	// TESSERA FORK: connect/init must NOT
-	// call GET /hosts, and there is no periodic background refresh anymore.
-	// The old code called sdk.refreshHosts(..., true) here and then spawned a
-	// 10-minute-ticker background refresh loop -- both removed. hostsCache
-	// starts empty; SDK.Upload/UploadPacked populate it at their own job
-	// start, and SDK.Download never touches it at all (job-scoped map
-	// instead). See SDK.Upload and SDK.Download for where each half of this
-	// law now lives.
+	// Hosts are not fetched here, and nothing refreshes them in the background.
+	// The cache starts empty. Upload and UploadPacked fill it at the start of
+	// each write. Download does not read it.
 
-	// start egress reporting if WithEgressURL configured it (this must run
-	// after every Option has been applied)
-	sdk.initEgress()
 	return sdk, nil
 }

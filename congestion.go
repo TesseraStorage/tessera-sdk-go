@@ -147,7 +147,7 @@ func (c *inflightController) record(permit samplePermit, elapsed time.Duration, 
 		return 0
 	}
 
-	// Little's law: throughput ≈ inflight / latency
+	// throughput is about inflight divided by latency
 	old, goodput := c.limit, 0.0
 	if c.elapsed > 0 {
 		goodput = float64(c.successes) * float64(old) / c.elapsed

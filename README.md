@@ -1,20 +1,26 @@
-# Sia Storage SDK
+# Tessera Go SDK
 
-The official Go SDK for storing and retrieving data on the Sia network.
+Tessera Go SDK (fork of the Sia Foundation's [siastorage](https://github.com/SiaFoundation/sia-storage-go)).
 
-For guides and additional resources, visit the [developer portal](https://devs.sia.storage). For detailed API documentation, see the [Godocs](https://pkg.go.dev/go.sia.tech/siastorage).
+Guides live at [tessera.storage/docs](https://tessera.storage/docs). Package documentation is on [pkg.go.dev](https://pkg.go.dev/github.com/TesseraStorage/tessera-sdk-go).
 
-## Connecting to the Indexer
+```
+go get github.com/TesseraStorage/tessera-sdk-go
+```
 
-Before uploading or downloading data, your application must connect to an
-indexer. First, create a `Builder` with your application metadata, then walk
-the user through the approval flow:
+The Go package name is `siastorage`.
+
+Download usage is metered by the server. This SDK does not report download bytes.
+
+## Connecting to the indexer
+
+Before uploading or downloading data, your application connects to the Tessera indexer. Create a `Builder` with your application metadata, then walk the user through the approval flow:
 
 ```go
-builder := siastorage.NewBuilder("https://sia.storage", siastorage.AppMetadata{
+builder := siastorage.NewBuilder("https://index.tessera.storage", siastorage.AppMetadata{
 	ID:          appID,                          // a persistent, randomly-generated 32-byte app ID
 	Name:        "MyApp",                        // display name
-	Description: "My first Sia application",     // short description
+	Description: "My first Tessera application", // short description
 	LogoURL:     "https://my.app/logo.png",      // logo shown in the indexer UI
 	ServiceURL:  "https://my.app",               // your application's homepage
 })
@@ -42,11 +48,10 @@ if err != nil {
 defer client.Close()
 ```
 
-On subsequent launches, skip the approval flow and create the SDK directly
-with the previously derived app key:
+On subsequent launches, skip the approval flow and create the SDK directly with the previously derived app key:
 
 ```go
-builder := siastorage.NewBuilder("https://sia.storage", siastorage.AppMetadata{ID: appID})
+builder := siastorage.NewBuilder("https://index.tessera.storage", siastorage.AppMetadata{ID: appID})
 client, err := builder.SDK(appKey)
 if err != nil {
 	log.Fatal("failed to create SDK:", err)
@@ -54,7 +59,7 @@ if err != nil {
 defer client.Close()
 ```
 
-## Uploading and Downloading Data
+## Uploading and downloading data
 
 Once connected, you can upload and download files using the SDK:
 
@@ -88,51 +93,26 @@ if _, err := io.Copy(out, rc); err != nil {
 }
 ```
 
-The `Object` returned by `Upload` contains the encryption key and slab
-metadata required to download the data later. After uploading, call
-`PinObject` to persist the object on the indexer. Applications should store
-the sealed object (via `obj.Seal(appKey)`) so it can be reopened later.
+The `Object` returned by `Upload` contains the encryption key and slab metadata required to download the data later. After uploading, call `PinObject` to persist the object on the indexer. Applications should store the sealed object (via `obj.Seal(appKey)`) so it can be reopened later.
 
-## Egress Reporting
+`Upload` and `UploadPacked` fetch the write host list (`GET /hosts`) once at the start of the call. `Download` fetches the hosts storing that object (`GET /objects/:key/hosts`) into a client used only for that download. Downloads do not call `GET /hosts`.
 
-Downloads can report served-shard egress to a Tessera moneyd endpoint so the
-account's usage and allowance are metered server-side. Reporting is opt-in and
-stays disabled until `WithEgressURL` is set; without it nothing is recorded.
+## Indexer application client
+
+`NewAppClient` is the indexer application client. It embeds the public `go.sia.tech/indexd/api/app` client and adds `ObjectHosts`.
 
 ```go
-client, err := builder.SDK(appKey,
-	siastorage.WithEgressURL("https://tessera.storage/api/v1/usage/egress"),
-	siastorage.WithEgressInterval(30*time.Second), // default: how long an event may wait
-	siastorage.WithEgressBatchMax(500),            // default: events per batch
-	siastorage.WithEgressSpoolPath("/var/lib/myapp/egress.spool")) // default: disabled
-if err != nil {
-	log.Fatal("failed to create SDK:", err)
-}
+api := siastorage.NewAppClient("https://index.tessera.storage")
+hosts, err := api.ObjectHosts(ctx, appKey, objectID) // GET /objects/:key/hosts
 ```
 
-- `WithEgressURL` enables reporting. `WithEgressInterval` bounds how long a
-  queued event waits before it is flushed, and `WithEgressBatchMax` flushes
-  immediately once that many events are queued; values above 1000 are clamped
-  to 1000, the server's per-batch event limit. A batch also stops taking
-  events once its cumulative bytes reach 512 MiB, well under the server's
-  1 GiB cap.
-- Recording is a cheap in-memory append: reads never block on the reporter and
-  a failed report never fails a read. The queue is bounded (oldest events
-  dropped); failed sends retry the identical signed envelope with exponential
-  backoff (1s to 60s), and non-retryable responses are dropped with a log line.
-- `WithEgressSpoolPath` persists signed envelopes that could not be delivered
-  so they are retried after a restart. The spool holds one canonical envelope
-  per line and is bounded at 8 MiB, oldest envelopes dropped.
+`Account`, `Hosts`, and the other application methods are the embedded public client. A non-2xx response from `ObjectHosts` is a `*app.HTTPError` from `go.sia.tech/indexd/api/app`.
 
-Batches are signed with the account's app key and must match the frozen
-cross-language wire contract (canonical compact JSON, `tessera-egress-v1:`
-Ed25519 preimage, `ed25519:<hex>` identity/signature); see
-`docs/egress-wire-golden.md` in the moneyd repo.
+Shared indexer types come from public `go.sia.tech/indexd` `v0.4.3-0.20260811102619-b064dc9575d1`.
 
-## Packed Uploads
+## Packed uploads
 
-When uploading many small objects, `UploadPacked` combines them into shared
-slabs to reduce overhead:
+When uploading many small objects, `UploadPacked` combines them into shared slabs to reduce overhead:
 
 ```go
 packed, err := client.UploadPacked()
@@ -158,10 +138,9 @@ for _, obj := range objects {
 }
 ```
 
-### Optimizing Packed Uploads
+### Optimizing packed uploads
 
-Use `Remaining()` and `Length()` to monitor padding and decide when to
-finalize:
+Use `Remaining()` and `Length()` to monitor padding and decide when to finalize:
 
 ```go
 const paddingTarget = 0.05
@@ -204,7 +183,7 @@ for len(uploads) > 0 {
 - Empty objects are not supported and will return `ErrEmptyObject`
 - Once `Finalize` is called, subsequent `Add` calls return `ErrUploadFinalized`
 
-## Sharing Objects
+## Sharing objects
 
 Objects can be shared via time-limited URLs:
 

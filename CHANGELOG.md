@@ -1,3 +1,18 @@
+## Tessera
+
+## 0.3.0 (2026-11-09)
+
+First Tessera release of this fork of the Sia Foundation's siastorage SDK.
+
+### Breaking changes
+
+- The module path is `github.com/TesseraStorage/tessera-sdk-go`. The package name remains `siastorage`.
+- Client download reporting is removed. `WithEgressURL`, `WithEgressInterval`, `WithEgressBatchMax`, and `WithEgressSpoolPath` no longer exist. Download usage is metered by the server.
+- Indexer application calls use public `go.sia.tech/indexd` `v0.4.3-0.20260811102619-b064dc9575d1` (`api/app`). `GET /objects/:key/hosts` is `AppClient.ObjectHosts` (`NewAppClient`).
+- A second upload or download attempt starts when a host takes more than 1.2 times the expected time.
+
+## Upstream history
+
 ## 0.2.0 (2026-08-12)
 
 ### Breaking Changes

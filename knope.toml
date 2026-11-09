@@ -52,4 +52,4 @@ type = "Release"
 
 [github]
 owner = "TesseraStorage"
-repo = "siastorage"
+repo = "tessera-sdk-go"

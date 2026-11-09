@@ -1,4 +1,4 @@
-module go.sia.tech/siastorage // v0.2.0
+module github.com/TesseraStorage/tessera-sdk-go // v0.3.0
 
 go 1.26.0
 
@@ -38,16 +38,3 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 )
-
-// TESSERA FORK: the pinned indexd
-// pseudo-version above (v0.4.3-...) predates `GET /objects/:key/hosts` /
-// Client.ObjectHosts (indexd commit d012a185, "T-indexd object map"),
-// which this SDK's Download() now depends on for the read-start law. That
-// endpoint has never been tagged/pushed as a real module version -- the
-// module cache only has an incomplete v0.5.0 (a .mod file with no .zip/.info,
-// fetched 2026-09-11, never a real release) and v0.4.4 (fetched same day,
-// also predates the object-hosts commit). ../indexd IS the
-// go.sia.tech/indexd module (same module path, see its go.mod) with that
-// commit already applied locally -- replace onto it directly rather than
-// waiting on a real tag.
-replace go.sia.tech/indexd => ../indexd

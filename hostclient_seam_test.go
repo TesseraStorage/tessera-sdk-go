@@ -1,9 +1,5 @@
 package siastorage
 
-// Proof that WithHostClient exposes the two events that are unavailable in the stock public API.
-// This is a COMPILE-AND-BEHAVIOUR test of the seam itself, not of upload logic: if this compiles,
-// an external integrator can implement the same wrapper, because it uses only exported names.
-
 import (
 	"context"
 	"io"
@@ -15,9 +11,10 @@ import (
 	"go.sia.tech/core/types"
 	rhp "go.sia.tech/coreutils/rhp/v4"
 	"go.sia.tech/indexd/client/v2"
+	"go.sia.tech/indexd/hosts"
 )
 
-// observer wraps a HostClient and records the events a dashboard needs.
+// observer wraps a HostClient and records host events.
 type observer struct {
 	HostClient // embedded: every method not overridden delegates untouched
 
@@ -27,7 +24,7 @@ type observer struct {
 	released int
 }
 
-// PickWrite is the "a write is starting on THIS host" trigger. Stock SDK has no equivalent.
+// PickWrite records that a write is starting on this host.
 func (o *observer) PickWrite(candidates []types.PublicKey) (types.PublicKey, func(), []types.PublicKey, bool) {
 	host, release, remaining, ok := o.HostClient.PickWrite(candidates)
 	if ok {
@@ -43,8 +40,7 @@ func (o *observer) PickWrite(candidates []types.PublicKey) (types.PublicKey, fun
 	}, remaining, ok
 }
 
-// AddFailedRPC is the "this host failed" trigger. Stock SDK swallows it: pool.swap() substitutes
-// the host and only the substitute's success is ever reported.
+// AddFailedRPC records that this host's RPC failed.
 func (o *observer) AddFailedRPC(hostKey types.PublicKey) {
 	o.mu.Lock()
 	o.failed = append(o.failed, hostKey)
@@ -85,8 +81,6 @@ func TestWithHostClientSeam(t *testing.T) {
 	base := &stubHost{}
 	obs := &observer{HostClient: base}
 
-	// The SDK applies the decorator during construction; here we exercise the wrapper directly to
-	// prove the contract an integrator relies on, without needing a live cluster.
 	hk := types.PublicKey{1, 2, 3}
 	host, release, _, ok := obs.PickWrite([]types.PublicKey{hk})
 	if !ok || host != hk {
@@ -130,5 +124,58 @@ func TestWithHostClientIdentity(t *testing.T) {
 	base := &stubHost{}
 	if got := sdk.wrapHosts(base); got != HostClient(base) {
 		t.Fatal("identity wrapper did not return the same client")
+	}
+}
+
+// TestWithHostClientAppliedByConstructor checks that initSDK wraps both the
+// write client and the per-download client.
+func TestWithHostClientAppliedByConstructor(t *testing.T) {
+	appKey := types.GeneratePrivateKey()
+	hostStore := newMockHostStore(1)
+	appMock := newMockAppClient(hostStore)
+	hk := types.GeneratePrivateKey().PublicKey()
+
+	obs := &observer{}
+	sdk, err := initSDK(appKey, appMock, WithHostClient(func(hc HostClient) HostClient {
+		obs.HostClient = hc
+		return obs
+	}))
+	if err != nil {
+		t.Fatalf("initSDK failed: %v", err)
+	}
+	defer sdk.Close()
+
+	sdk.hostsCache.updateHosts([]hosts.HostInfo{{PublicKey: hk, GoodForUpload: true}})
+
+	picked, release, remaining, ok := sdk.hosts.PickWrite([]types.PublicKey{hk})
+	if !ok || picked != hk || len(remaining) != 0 {
+		t.Fatalf("PickWrite = (%v, _, %v, %v), want (%v, _, [], true)", picked, remaining, ok, hk)
+	}
+	release()
+	sdk.hosts.AddFailedRPC(hk)
+	if got := sdk.hosts.Prioritize([]types.PublicKey{hk}); len(got) != 1 || got[0] != hk {
+		t.Fatalf("Prioritize = %v, want [%v]", got, hk)
+	}
+
+	scopedStore := newHostCache()
+	scopedStore.updateHosts([]hosts.HostInfo{{PublicKey: hk, GoodForUpload: true}})
+	scoped := sdk.newHosts(scopedStore)
+	pickedScoped, releaseScoped, _, okScoped := scoped.PickWrite([]types.PublicKey{hk})
+	if !okScoped || pickedScoped != hk {
+		t.Fatalf("scoped PickWrite = (%v, _, _, %v), want (%v, _, _, true)", pickedScoped, okScoped, hk)
+	}
+	releaseScoped()
+	scoped.Close()
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.picked) != 2 || obs.picked[0] != hk || obs.picked[1] != hk {
+		t.Fatalf("decorator observed picks %v, want [%v %v]", obs.picked, hk, hk)
+	}
+	if obs.released != 2 {
+		t.Fatalf("decorator observed %d releases, want 2", obs.released)
+	}
+	if len(obs.failed) != 1 || obs.failed[0] != hk {
+		t.Fatalf("decorator observed failures %v, want [%v]", obs.failed, hk)
 	}
 }

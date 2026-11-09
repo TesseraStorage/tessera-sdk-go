@@ -10,7 +10,7 @@ import (
 	"go.sia.tech/core/types"
 	"go.sia.tech/coreutils/threadgroup"
 	"go.sia.tech/coreutils/wallet"
-	"go.sia.tech/indexd/api/appclient"
+	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/keys"
 	"go.uber.org/zap"
 	"lukechampine.com/frand"
@@ -40,7 +40,7 @@ var (
 
 	// ErrUserRejected is returned by [Builder.WaitForApproval] when
 	// the user rejects the connection request.
-	ErrUserRejected = appclient.ErrUserRejected
+	ErrUserRejected = app.ErrUserRejected
 )
 
 type (
@@ -73,10 +73,10 @@ type (
 // on the same Builder return [ErrBuilderConsumed].
 type Builder struct {
 	ephemeralKey types.PrivateKey
-	client       *appclient.Client
+	client       *AppClient
 
-	info         appclient.Info
-	registerResp *appclient.RegisterAppResponse
+	info         app.Info
+	registerResp *app.RegisterAppResponse
 	sharedSecret types.Hash256
 
 	consumed *atomic.Bool
@@ -222,10 +222,9 @@ func (b *Builder) SDK(appKey types.PrivateKey, opts ...Option) (*SDK, error) {
 			app:        b.mockApp,
 			hosts:      b.mockHost,
 			hostsCache: b.mockHostCache,
-			// mock builds hand every download the SAME mock hostClient,
-			// ignoring the job-scoped store -- the mock records RPCs by
-			// pubkey/root, not by which Provider/store backs it. (Tessera
-			// fork)
+			// Mock builds give every download the same mock host client.
+			// The mock records RPCs by public key, not by which store
+			// backs the client.
 			newHosts: func(*hostCache) hostClient { return b.mockHost },
 			tg:       threadgroup.New(),
 			log:      zap.NewNop(),
@@ -270,7 +269,7 @@ func deriveAppKey(mnemonic string, appID types.Hash256, sharedSecret types.Hash2
 func NewBuilder(indexerURL string, metadata AppMetadata) *Builder {
 	return &Builder{
 		ephemeralKey: types.GeneratePrivateKey(),
-		info: appclient.Info{
+		info: app.Info{
 			AppID:       metadata.ID,
 			Name:        metadata.Name,
 			Description: metadata.Description,
@@ -278,7 +277,7 @@ func NewBuilder(indexerURL string, metadata AppMetadata) *Builder {
 			ServiceURL:  metadata.ServiceURL,
 			CallbackURL: metadata.CallbackURL,
 		},
-		client:   appclient.NewClient(indexerURL),
+		client:   NewAppClient(indexerURL),
 		consumed: &atomic.Bool{},
 	}
 }

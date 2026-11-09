@@ -3,10 +3,10 @@ package siastorage
 import "sync"
 
 const (
-	// raceFactor sets how long we wait before racing. We only start a second
-	// attempt once a host takes more than raceFactor times the normal time, so
-	// only the real stragglers get raced.
-	raceFactor = 1.5
+	// raceFactor sets how long we wait before racing. A second attempt starts
+	// only after a host takes more than raceFactor times the expected time, so
+	// only the slowest hosts are raced.
+	raceFactor = 1.2
 
 	// raceWindow limits how far ahead of the read head a chunk may race. Racing
 	// chunks the reader does not need yet would steal bandwidth from the ones it

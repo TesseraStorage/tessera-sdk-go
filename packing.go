@@ -233,8 +233,8 @@ func (o *packedObject) slabRange(slabSize int64) (start, end int64) {
 // used to add objects and then finalized to get the resulting objects. A packed
 // upload is not thread-safe.
 //
-// TESSERA FORK: same write-start-fetch law
-// as [SDK.Upload] -- see that method's comment.
+// UploadPacked fetches the write host list once, at the start of the call,
+// the same way [SDK.Upload] does.
 func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 	// create upload options
 	uo, enc, err := newUploadOption(opts...)

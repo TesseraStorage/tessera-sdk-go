@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"go.sia.tech/core/types"
-	"go.sia.tech/indexd/api/appclient"
+	"go.sia.tech/indexd/api/app"
 )
 
 func TestBuilder(t *testing.T) {
@@ -22,7 +22,7 @@ func TestBuilder(t *testing.T) {
 
 	t.Run("WaitForApprovalExpired", func(t *testing.T) {
 		b := newMockBuilder(newMockAppClient(nil), nil, nil)
-		b.registerResp = &appclient.RegisterAppResponse{Expiration: time.Now().Add(-time.Second)}
+		b.registerResp = &app.RegisterAppResponse{Expiration: time.Now().Add(-time.Second)}
 		if err := b.WaitForApproval(t.Context()); !errors.Is(err, ErrRequestExpired) {
 			t.Fatalf("expected ErrRequestExpired, got %v", err)
 		}
@@ -30,7 +30,7 @@ func TestBuilder(t *testing.T) {
 
 	t.Run("WaitForApprovalDeadline", func(t *testing.T) {
 		b := newMockBuilder(newMockAppClient(nil), nil, nil)
-		b.registerResp = &appclient.RegisterAppResponse{Expiration: time.Now().Add(50 * time.Millisecond)}
+		b.registerResp = &app.RegisterAppResponse{Expiration: time.Now().Add(50 * time.Millisecond)}
 		if err := b.WaitForApproval(t.Context()); !errors.Is(err, ErrRequestExpired) {
 			t.Fatalf("expected ErrRequestExpired, got %v", err)
 		}
@@ -42,8 +42,8 @@ func TestBuilder(t *testing.T) {
 
 		b := newMockBuilder(newMockAppClient(nil), nil, nil)
 		b.ephemeralKey = types.GeneratePrivateKey()
-		b.client = appclient.NewClient(srv.URL)
-		b.registerResp = &appclient.RegisterAppResponse{
+		b.client = NewAppClient(srv.URL)
+		b.registerResp = &app.RegisterAppResponse{
 			StatusURL:  srv.URL,
 			Expiration: time.Now().Add(time.Hour),
 		}
@@ -54,7 +54,7 @@ func TestBuilder(t *testing.T) {
 
 	t.Run("WaitForApprovalCancel", func(t *testing.T) {
 		b := newMockBuilder(newMockAppClient(nil), nil, nil)
-		b.registerResp = &appclient.RegisterAppResponse{Expiration: time.Now().Add(time.Hour)}
+		b.registerResp = &app.RegisterAppResponse{Expiration: time.Now().Add(time.Hour)}
 
 		cause := errors.New("cause")
 		ctx, cancel := context.WithCancelCause(t.Context())

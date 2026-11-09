@@ -8,7 +8,6 @@ updates:
   - package-ecosystem: "gomod"
     directories:
       - "/"
-      - "/examples"
     schedule:
       interval: "weekly"
     groups:

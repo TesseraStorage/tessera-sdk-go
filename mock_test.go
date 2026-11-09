@@ -18,7 +18,7 @@ import (
 	"go.sia.tech/core/types"
 	"go.sia.tech/coreutils/rhp/v4"
 	"go.sia.tech/indexd/api"
-	"go.sia.tech/indexd/api/appclient"
+	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
@@ -476,8 +476,8 @@ func newMockAppClient(hosts *hostCache) *mockAppClient {
 }
 
 // Account implements the [appClient] interface.
-func (mc *mockAppClient) Account(_ context.Context, _ types.PrivateKey) (resp appclient.AccountResponse, err error) {
-	return appclient.AccountResponse{}, nil
+func (mc *mockAppClient) Account(_ context.Context, _ types.PrivateKey) (resp app.AccountResponse, err error) {
+	return app.AccountResponse{}, nil
 }
 
 // PinSlabs implements the [appClient] interface.
@@ -543,12 +543,9 @@ func (mc *mockAppClient) Hosts(context.Context, types.PrivateKey, ...api.URLQuer
 	return mc.hosts.UsableHosts()
 }
 
-// ObjectHosts implements the [appClient] interface. The mock does not track
-// per-object host membership, so it mirrors Hosts (same override, same
-// backing store) -- tests that need to simulate a real indexd's map should
-// use SetHosts, which both Hosts and ObjectHosts now read from.
-//
-// TESSERA FORK.
+// ObjectHosts implements [appClient]. The mock does not track which hosts
+// store an object, so it returns the same list as Hosts. SetHosts changes
+// the list both methods return.
 func (mc *mockAppClient) ObjectHosts(ctx context.Context, appKey types.PrivateKey, _ types.Hash256) ([]hosts.HostInfo, error) {
 	return mc.Hosts(ctx, appKey)
 }

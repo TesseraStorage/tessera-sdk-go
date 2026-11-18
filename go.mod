@@ -1,4 +1,4 @@
-module github.com/TesseraStorage/tessera-sdk-go // v0.3.0
+module github.com/TesseraStorage/tessera-sdk-go // v0.4.0
 
 go 1.26.0
 

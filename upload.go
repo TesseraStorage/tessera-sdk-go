@@ -53,6 +53,9 @@ type (
 		hosts      hostClient
 		accountKey types.PrivateKey
 		onProgress func(ShardProgress)
+		// onWriteAttempt, when set, is called as each WriteSector RPC
+		// starts. Only the agent hooks set it.
+		onWriteAttempt func()
 
 		encryptionKey [32]byte
 		slabIndex     int
@@ -80,6 +83,9 @@ type (
 		// slabs. Zero derives it from the memory budget.
 		maxBufferedSlabs int
 		onProgress       func(ShardProgress)
+		// onWriteAttempt, when set, is called as each WriteSector RPC
+		// starts. Only the agent hooks set it.
+		onWriteAttempt func()
 	}
 )
 
@@ -297,16 +303,17 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		}
 
 		su := shardUpload{
-			hosts:         s.hosts,
-			accountKey:    s.appKey,
-			onProgress:    uo.onProgress,
-			encryptionKey: slabKeys.key(i),
-			slabIndex:     i,
-			limiter:       limiter,
-			pool:          newUploadPool(s.hosts, candidates, totalShards),
-			commitment:    slabCommitment,
-			shardsCh:      make(chan shard, totalShards),
-			waiting:       waiting,
+			hosts:          s.hosts,
+			accountKey:     s.appKey,
+			onProgress:     uo.onProgress,
+			onWriteAttempt: uo.onWriteAttempt,
+			encryptionKey:  slabKeys.key(i),
+			slabIndex:      i,
+			limiter:        limiter,
+			pool:           newUploadPool(s.hosts, candidates, totalShards),
+			commitment:     slabCommitment,
+			shardsCh:       make(chan shard, totalShards),
+			waiting:        waiting,
 		}
 
 		// count this slab's shards as waiting before the encode goroutine starts
@@ -405,6 +412,9 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 		active++
 		go func() {
 			permit := su.limiter.sample()
+			if su.onWriteAttempt != nil {
+				su.onWriteAttempt()
+			}
 			start := time.Now()
 			root, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
 			elapsed := time.Since(start)

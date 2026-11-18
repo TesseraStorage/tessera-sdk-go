@@ -355,13 +355,13 @@ func (s *SDK) DeleteObject(ctx context.Context, key types.Hash256) error {
 // as the last Upload or UploadPacked.
 func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) error {
 	if s.hooks.OnUploadComplete == nil && s.hooks.OnWriteFailed == nil {
-		return s.upload(ctx, obj, r, opts...)
+		return s.uploadObject(ctx, obj, r, opts...)
 	}
 
 	start := time.Now()
 	var counters uploadCounters
 	opts = append(opts[:len(opts):len(opts)], counters.option())
-	err := s.upload(ctx, obj, r, opts...)
+	err := s.uploadObject(ctx, obj, r, opts...)
 	elapsed := time.Since(start)
 	attempts, acks := int(counters.attempts.Load()), int(counters.acks.Load())
 
@@ -396,7 +396,7 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 	return nil
 }
 
-func (s *SDK) upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) error {
+func (s *SDK) uploadObject(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -446,11 +446,11 @@ func (s *SDK) upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
 	fn := s.hooks.OnDownloadComplete
 	if fn == nil {
-		return s.download(obj, opts...)
+		return s.downloadObject(obj, opts...)
 	}
 
 	start := time.Now()
-	rc, err := s.download(obj, opts...)
+	rc, err := s.downloadObject(obj, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -461,7 +461,7 @@ func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error
 	}}, nil
 }
 
-func (s *SDK) download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
+func (s *SDK) downloadObject(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
 	do, err := newDownloadOption(obj.Size(), opts...)
 	if err != nil {
 		return nil, err
@@ -671,12 +671,12 @@ func (s *SDK) Close() error {
 func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	fn := s.hooks.OnWriteFailed
 	if fn == nil {
-		_, err := s.pinObject(ctx, obj)
+		_, err := s.pinObjectSlabs(ctx, obj)
 		return err
 	}
 
 	start := time.Now()
-	pinned, err := s.pinObject(ctx, obj)
+	pinned, err := s.pinObjectSlabs(ctx, obj)
 	if err != nil {
 		ev := WriteFailedEvent{
 			Stage:       WritePinFailed,
@@ -690,9 +690,9 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	return err
 }
 
-// pinObject pins the object and reports how many slabs the indexer
+// pinObjectSlabs pins the object and reports how many slabs the indexer
 // confirmed as pinned, which is less than len(obj.slabs) on error.
-func (s *SDK) pinObject(ctx context.Context, obj Object) (pinned int, _ error) {
+func (s *SDK) pinObjectSlabs(ctx context.Context, obj Object) (pinned int, _ error) {
 	params := make([]slabs.SlabPinParams, len(obj.slabs))
 	for i, slab := range obj.slabs {
 		params[i] = slabs.SlabPinParams{

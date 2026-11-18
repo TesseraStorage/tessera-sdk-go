@@ -97,6 +97,65 @@ The `Object` returned by `Upload` contains the encryption key and slab metadata 
 
 `Upload` and `UploadPacked` fetch the write host list (`GET /hosts`) once at the start of the call. `Download` fetches the hosts storing that object (`GET /objects/:key/hosts`) into a client used only for that download. Downloads do not call `GET /hosts`.
 
+## Agent hooks
+
+Agents and other unattended callers often need to record what they stored and to know when a write did not land. `WithAgentHooks` sets optional callbacks for that. Without it the SDK behaves exactly as before.
+
+```go
+client, err := builder.SDK(appKey, siastorage.WithAgentHooks(siastorage.AgentHooks{
+	OnUploadComplete: func(ev siastorage.UploadCompleteEvent) {
+		log.Printf("uploaded %s: %d bytes in %s", ev.ObjectID, ev.Size, ev.Elapsed)
+	},
+	OnDownloadComplete: func(ev siastorage.DownloadCompleteEvent) {
+		log.Printf("downloaded %s: %d bytes", ev.ObjectID, ev.Bytes)
+	},
+	OnWriteFailed: func(ev siastorage.WriteFailedEvent) {
+		switch ev.Stage {
+		case siastorage.WriteNotSent:
+			// no object data left the process; retry when ready
+		case siastorage.WriteSentNotRegistered:
+			// shards may be on hosts, but no object exists; retry with a new Object
+		case siastorage.WritePinFailed:
+			// data uploaded but the object was not saved; call PinObject again
+		}
+		log.Printf("write failed (%s): %v", ev.Stage, ev.Err)
+	},
+}))
+```
+
+- `OnUploadComplete` runs after `Upload` returns nil. The object is not tracked by the indexer until `PinObject` succeeds.
+- `OnDownloadComplete` runs when a reader returned by `Download` has delivered its last byte. A reader closed early or ending in an error does not call it.
+- `OnWriteFailed` runs when `Upload` or `PinObject` returns an error. `Stage` tells a write that never left the process (`WriteNotSent`, no shard write started) from one that sent data but was not registered (`WriteSentNotRegistered`), and from a failed pin (`WritePinFailed`). `WriteAttemptsStarted`, `ShardsAcknowledged` and `SlabsPinned` give the counts behind the stage.
+
+Hooks are fire-and-forget. Each call runs in its own goroutine, the SDK does not wait for it, and a panic inside a hook is recovered and logged without changing the result of the transfer. `UploadPacked` and `DownloadSharedObject` do not call the hooks; packed objects still report pin failures through `PinObject`.
+
+### Agent metadata
+
+`SetAgentMetadata` records which agent wrote an object, under the `agent` key of the object's metadata. The metadata is encrypted with the rest of the object metadata when the object is sealed, so the indexer never sees it in plaintext. Other metadata keys are kept unchanged.
+
+```go
+obj := siastorage.NewEmptyObject()
+if err := client.Upload(ctx, &obj, f); err != nil {
+	log.Fatal(err)
+}
+if err := obj.SetAgentMetadata(siastorage.AgentMetadata{
+	Name:   "nightly-exporter",
+	Run:    runID,
+	Task:   "export orders table",
+	Labels: map[string]string{"env": "prod"},
+}); err != nil {
+	log.Fatal(err)
+}
+if err := client.PinObject(ctx, obj); err != nil { // saves the metadata
+	log.Fatal(err)
+}
+
+// later
+meta, ok, err := obj.AgentMetadata()
+```
+
+`SetAgentMetadata` returns `ErrMetadataNotObject` and leaves the metadata unchanged if the existing metadata is not a JSON object.
+
 ## Indexer application client
 
 `NewAppClient` is the indexer application client. It embeds the public `go.sia.tech/indexd/api/app` client and adds `ObjectHosts`.

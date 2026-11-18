@@ -1,5 +1,13 @@
 ## Tessera
 
+## 0.4.0 (2026-11-18)
+
+### Features
+
+- Agent hooks: `WithAgentHooks` sets optional `OnUploadComplete`, `OnDownloadComplete` and `OnWriteFailed` callbacks. Hooks are fire-and-forget and a panic in a hook does not affect the transfer.
+- `WriteFailedEvent.Stage` tells a write that never left the process (`WriteNotSent`) from one that sent shard data but was not registered (`WriteSentNotRegistered`) and from a failed pin (`WritePinFailed`, with `SlabsPinned`).
+- `Object.SetAgentMetadata` and `Object.AgentMetadata` store and read `AgentMetadata` under the `agent` key of the encrypted object metadata, keeping other keys unchanged.
+
 ## 0.3.0 (2026-11-09)
 
 First Tessera release of this fork of the Sia Foundation's siastorage SDK.

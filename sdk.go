@@ -122,6 +122,9 @@ type (
 
 		tg  *threadgroup.ThreadGroup
 		log *zap.Logger
+
+		// hooks are the optional callbacks set by WithAgentHooks.
+		hooks AgentHooks
 	}
 )
 
@@ -351,6 +354,49 @@ func (s *SDK) DeleteObject(ctx context.Context, key types.Hash256) error {
 // call. The SDK does not refresh that list on a timer, so it is only as new
 // as the last Upload or UploadPacked.
 func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) error {
+	if s.hooks.OnUploadComplete == nil && s.hooks.OnWriteFailed == nil {
+		return s.upload(ctx, obj, r, opts...)
+	}
+
+	start := time.Now()
+	var counters uploadCounters
+	opts = append(opts[:len(opts):len(opts)], counters.option())
+	err := s.upload(ctx, obj, r, opts...)
+	elapsed := time.Since(start)
+	attempts, acks := int(counters.attempts.Load()), int(counters.acks.Load())
+
+	if err != nil {
+		if fn := s.hooks.OnWriteFailed; fn != nil {
+			stage := WriteNotSent
+			if attempts > 0 {
+				stage = WriteSentNotRegistered
+			}
+			ev := WriteFailedEvent{
+				Stage:                stage,
+				Err:                  err,
+				WriteAttemptsStarted: attempts,
+				ShardsAcknowledged:   acks,
+				Elapsed:              elapsed,
+			}
+			s.fireHook("OnWriteFailed", func() { fn(ev) })
+		}
+		return err
+	}
+
+	if fn := s.hooks.OnUploadComplete; fn != nil {
+		ev := UploadCompleteEvent{
+			ObjectID:           obj.ID(),
+			Size:               obj.Size(),
+			Slabs:              len(obj.slabs),
+			ShardsAcknowledged: acks,
+			Elapsed:            elapsed,
+		}
+		s.fireHook("OnUploadComplete", func() { fn(ev) })
+	}
+	return nil
+}
+
+func (s *SDK) upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -398,6 +444,24 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 // returned reader is closed. Downloads do not call GET /hosts and do not use
 // the host list Upload fills.
 func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
+	fn := s.hooks.OnDownloadComplete
+	if fn == nil {
+		return s.download(obj, opts...)
+	}
+
+	start := time.Now()
+	rc, err := s.download(obj, opts...)
+	if err != nil {
+		return nil, err
+	}
+	objectID := obj.ID()
+	return &completionReader{rc: rc, done: func(n uint64) {
+		ev := DownloadCompleteEvent{ObjectID: objectID, Bytes: n, Elapsed: time.Since(start)}
+		s.fireHook("OnDownloadComplete", func() { fn(ev) })
+	}}, nil
+}
+
+func (s *SDK) download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
 	do, err := newDownloadOption(obj.Size(), opts...)
 	if err != nil {
 		return nil, err
@@ -605,6 +669,30 @@ func (s *SDK) Close() error {
 // PinObject pins the object's slabs and saves the object metadata to the
 // indexer.
 func (s *SDK) PinObject(ctx context.Context, obj Object) error {
+	fn := s.hooks.OnWriteFailed
+	if fn == nil {
+		_, err := s.pinObject(ctx, obj)
+		return err
+	}
+
+	start := time.Now()
+	pinned, err := s.pinObject(ctx, obj)
+	if err != nil {
+		ev := WriteFailedEvent{
+			Stage:       WritePinFailed,
+			Err:         err,
+			ObjectID:    obj.ID(),
+			SlabsPinned: pinned,
+			Elapsed:     time.Since(start),
+		}
+		s.fireHook("OnWriteFailed", func() { fn(ev) })
+	}
+	return err
+}
+
+// pinObject pins the object and reports how many slabs the indexer
+// confirmed as pinned, which is less than len(obj.slabs) on error.
+func (s *SDK) pinObject(ctx context.Context, obj Object) (pinned int, _ error) {
 	params := make([]slabs.SlabPinParams, len(obj.slabs))
 	for i, slab := range obj.slabs {
 		params[i] = slabs.SlabPinParams{
@@ -614,7 +702,7 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 			Sectors:       slab.Sectors,
 		}
 		if err := params[i].Validate(); err != nil {
-			return fmt.Errorf("slab %d invalid: %w", i, err)
+			return 0, fmt.Errorf("slab %d invalid: %w", i, err)
 		}
 	}
 
@@ -623,17 +711,18 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 
 		slabIDs, err := s.app.PinSlabs(ctx, s.appKey, params[i:end]...)
 		if err != nil {
-			return fmt.Errorf("failed to pin slabs: %w", err)
+			return pinned, fmt.Errorf("failed to pin slabs: %w", err)
 		}
 
 		for j, slab := range obj.slabs[i:end] {
 			if expected := slab.Digest(); slabIDs[j] != expected {
-				return fmt.Errorf("slab %d: pinned id %s does not match expected id %s", i+j, slabIDs[j], expected)
+				return pinned, fmt.Errorf("slab %d: pinned id %s does not match expected id %s", i+j, slabIDs[j], expected)
 			}
 		}
+		pinned = end
 	}
 
-	return s.app.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
+	return pinned, s.app.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
 }
 
 const (

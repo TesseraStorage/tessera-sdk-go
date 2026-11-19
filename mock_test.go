@@ -44,6 +44,29 @@ type hostErr struct {
 	err       error
 }
 
+// timedOutRPC records one AddTimedOutRPC call. AddTimedOutRPC is optional on
+// HostClient; the mock implements it so tests can see the throughput sample.
+type timedOutRPC struct {
+	hostKey types.PublicKey
+	write   bool
+	bytes   uint64
+	elapsed time.Duration
+}
+
+// assertSample checks the throughput sample the timeout was recorded with. The
+// host key is left to the caller, which knows whether it expects one host or
+// any of a set.
+func (rpc timedOutRPC) assertSample(t testing.TB, write bool, bytes uint64) {
+	t.Helper()
+	if rpc.write != write {
+		t.Fatalf("expected write=%v for %v, got %v", write, rpc.hostKey, rpc.write)
+	} else if rpc.bytes != bytes {
+		t.Fatalf("expected %d bytes for %v, got %d", bytes, rpc.hostKey, rpc.bytes)
+	} else if rpc.elapsed <= 0 {
+		t.Fatalf("expected a positive elapsed for %v, got %v", rpc.hostKey, rpc.elapsed)
+	}
+}
+
 type mockHostClient struct {
 	provider *client.Provider
 	hosts    *hostCache
@@ -71,6 +94,12 @@ type mockHostClient struct {
 
 	pricesMu    sync.Mutex
 	pricesCalls map[types.PublicKey]int
+
+	timeoutMu    sync.Mutex
+	timedOutRPCs []timedOutRPC
+
+	failedMu   sync.Mutex
+	failedRPCs []types.PublicKey
 }
 
 // Close implements the [hostClient] interface.
@@ -78,8 +107,80 @@ func (m *mockHostClient) Close() error {
 	return nil
 }
 
-// AddFailedRPC implements the [hostClient] interface.
+// AddTimedOutRPC records an attempt that burned its own deadline, including the
+// throughput sample, and forwards it to the provider.
+func (m *mockHostClient) AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration) {
+	m.timeoutMu.Lock()
+	m.timedOutRPCs = append(m.timedOutRPCs, timedOutRPC{hostKey: hostKey, write: write, bytes: bytes, elapsed: elapsed})
+	m.timeoutMu.Unlock()
+	m.provider.AddTimedOutRPC(hostKey, write, bytes, elapsed)
+}
+
+// waitTimedOutRPCs waits for n timed out RPCs to be recorded, then returns
+// them. Attempts report as they unwind, so a transfer may finish before every
+// host it gave up on has reported.
+func (m *mockHostClient) waitTimedOutRPCs(t testing.TB, n int) []timedOutRPC {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.timeoutMu.Lock()
+		rpcs := slices.Clone(m.timedOutRPCs)
+		m.timeoutMu.Unlock()
+		if len(rpcs) >= n {
+			return rpcs
+		} else if time.Now().After(deadline) {
+			t.Fatalf("expected %d timed out RPCs, got %d", n, len(rpcs))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TimedOutRPCs returns the timed out RPCs recorded so far, for tests asserting
+// that a failed RPC carried no throughput sample.
+func (m *mockHostClient) TimedOutRPCs() []timedOutRPC {
+	m.timeoutMu.Lock()
+	defer m.timeoutMu.Unlock()
+	return slices.Clone(m.timedOutRPCs)
+}
+
+// AddFailedRPC implements the [hostClient] interface, recording the call for
+// inspection by tests. Only the failure samples the SDK decides on land here;
+// the ones the client itself records go through [mockHostClient.recordFailedRPC].
 func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
+	m.failedMu.Lock()
+	m.failedRPCs = append(m.failedRPCs, hostKey)
+	m.failedMu.Unlock()
+	m.provider.AddFailedRPC(hostKey)
+}
+
+// waitFailedRPCs waits for n failed RPCs to be recorded, then returns the hosts
+// they were recorded against. Attempts report as they unwind, so a transfer may
+// finish before every host it gave up on has reported.
+func (m *mockHostClient) waitFailedRPCs(t testing.TB, n int) []types.PublicKey {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.failedMu.Lock()
+		hks := slices.Clone(m.failedRPCs)
+		m.failedMu.Unlock()
+		if len(hks) >= n {
+			return hks
+		} else if time.Now().After(deadline) {
+			t.Fatalf("expected %d failed RPCs, got %d", n, len(hks))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// recordFailedRPC mirrors the context half of the real client's failure
+// accounting: an RPC interrupted by its context is not counted against the
+// host, since the client cannot tell a host that misbehaved from a caller
+// that cancelled. Only the caller owning the deadline can, so it reports
+// those itself.
+func (m *mockHostClient) recordFailedRPC(ctx context.Context, hostKey types.PublicKey) {
+	if ctx.Err() != nil {
+		return
+	}
 	m.provider.AddFailedRPC(hostKey)
 }
 
@@ -161,7 +262,7 @@ func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) err
 	case <-ctx.Done():
 	case <-time.After(delay):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
 }
 
 func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) error {
@@ -179,7 +280,7 @@ func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) er
 	case <-ctx.Done():
 	case <-time.After(delay):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
 }
 
 func (m *mockHostClient) hostError(hostKey types.PublicKey) error {
@@ -203,7 +304,7 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey)
+			m.recordFailedRPC(ctx, hostKey)
 		} else {
 			m.provider.AddWriteSample(hostKey, uint64(len(data)), time.Since(start))
 		}
@@ -242,7 +343,7 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey)
+			m.recordFailedRPC(ctx, hostKey)
 		} else {
 			m.provider.AddReadSample(hostKey, length, time.Since(start))
 		}
@@ -299,7 +400,7 @@ func (m *mockHostClient) Prices(ctx context.Context, hostKey types.PublicKey) (_
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey)
+			m.recordFailedRPC(ctx, hostKey)
 		} else {
 			m.provider.AddSettingsSample(hostKey, time.Since(start))
 		}
@@ -381,7 +482,19 @@ func (m *mockHostClient) jitterDelay(ctx context.Context) error {
 	case <-ctx.Done():
 	case <-time.After(d):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
+}
+
+// timeoutErr mirrors the real transport, where an expired deadline surfaces as
+// a closed stream rather than a deadline error. The sentinel is local so the
+// test mock does not take a direct dependency on the mux package; detection
+// keys off the attempt context, which still carries DeadlineExceeded.
+func timeoutErr(ctx context.Context) error {
+	err := context.Cause(ctx)
+	if err == context.DeadlineExceeded {
+		return errors.New("stream was gracefully closed")
+	}
+	return err
 }
 
 // SetReadJitter delays every sector read by a duration drawn from fn. It

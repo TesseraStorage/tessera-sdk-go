@@ -416,7 +416,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 				su.onWriteAttempt()
 			}
 			start := time.Now()
-			root, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
+			root, _, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
 			elapsed := time.Since(start)
 			// a racer aborted because another attempt won measured the
 			// cancellation, not the network, so it is not a congestion signal

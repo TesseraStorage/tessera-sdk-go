@@ -625,6 +625,79 @@ func TestRefreshHosts(t *testing.T) {
 	}
 }
 
+// TestWriteSectorTimeout asserts writeSector reports the attempt deadline it
+// owns, but not one inherited from its caller, so only a host that stalled for
+// the whole attempt is reported as having timed out.
+func TestWriteSectorTimeout(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 1, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	usable, _ := hosts.hosts.UsableHosts()
+	hostKey := usable[0].PublicKey
+	hosts.SetSlowHostKeys([]types.PublicKey{hostKey}, time.Second)
+	data := make([]byte, 1024)
+
+	_, timedOut, err := writeSector(t.Context(), hosts, sdk.appKey, hostKey, data, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected the write to fail")
+	} else if !timedOut {
+		t.Fatal("a stalled write was not reported as timed out")
+	}
+
+	// a deadline on the caller's context is cancellation from above, not
+	// evidence that the host stalled for the upload timeout
+	parent, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	_, timedOut, err = writeSector(parent, hosts, sdk.appKey, hostKey, data, time.Second)
+	if err == nil {
+		t.Fatal("expected the write to fail")
+	} else if timedOut {
+		t.Fatal("the caller's deadline was reported as a host timeout")
+	}
+}
+
+type failCounter struct {
+	stubHost
+	failed int
+}
+
+func (f *failCounter) AddFailedRPC(types.PublicKey) { f.failed++ }
+
+// TestReportHostTimeoutFallsBack keeps HostClient unchanged: a client that
+// does not implement AddTimedOutRPC is still demoted through AddFailedRPC.
+func TestReportHostTimeoutFallsBack(t *testing.T) {
+	f := &failCounter{}
+	reportHostTimeout(f, types.PublicKey{1}, false, 0, time.Second)
+	if f.failed != 1 {
+		t.Fatalf("expected AddFailedRPC, got %d calls", f.failed)
+	}
+}
+
+func TestWarmupDemotesUnresponsiveHost(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 3, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	usable, _ := hosts.hosts.UsableHosts()
+	slow := usable[0].PublicKey
+	hosts.SetSlowHostKeys([]types.PublicKey{slow}, 5*time.Second)
+
+	keys := make([]types.PublicKey, 0, len(usable))
+	for _, hi := range usable {
+		keys = append(keys, hi.PublicKey)
+	}
+	if err := sdk.warmConnections(t.Context(), keys); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert only the host that reached the warmup deadline was demoted
+	failed := hosts.waitFailedRPCs(t, 1)
+	if len(failed) != 1 {
+		t.Fatal("unexpected demotions", failed)
+	} else if failed[0] != slow {
+		t.Fatal("expected the unresponsive host to be demoted, got", failed[0])
+	}
+}
+
 // object size for the transfer benchmarks. at the default most of a run is
 // spent ramping the adaptive limit rather than at steady state
 var benchSize = flag.Int("bench.size", 256*1000*1000, "object size in bytes for the transfer benchmarks")

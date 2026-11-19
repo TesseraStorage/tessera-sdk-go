@@ -36,6 +36,15 @@ type (
 	// AddFailedRPC reports that a host RPC failed. Upload progress does not
 	// include either event: it fires once per successful shard and names only
 	// the host that finished it.
+	//
+	// A client may also implement AddTimedOutRPC:
+	//
+	//	AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration)
+	//
+	// The SDK calls that method when an attempt reaches its own deadline, so
+	// the host is demoted with a throughput sample. Clients that do not
+	// implement it are demoted through AddFailedRPC instead. The method is
+	// not part of this interface, so existing implementations keep compiling.
 	HostClient interface {
 		Prices(ctx context.Context, hostKey types.PublicKey) (prices proto4.HostPrices, err error)
 		ReadSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
@@ -203,17 +212,21 @@ func (s *SDK) downloadSlab(ctx context.Context, hc hostClient, slab slabs.SlabSl
 		wg.Go(func() {
 			defer release()
 			permit := limiter.sample()
-			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
-			start := time.Now()
-			_, err := hc.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
-			elapsed := time.Since(start)
+			elapsed, timedOut, err := timedAttempt(ctx, timeout, func(ctx context.Context) error {
+				_, err := hc.ReadSector(ctx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
+				return err
+			})
 			// a read aborted because the chunk already had enough shards
 			// measured the cancellation, not the network, so it is not a
 			// congestion signal
 			if ctx.Err() == nil {
 				limiter.record(permit, elapsed, err == nil)
+			}
+			// the bytes that landed are the worst-case throughput sample; the
+			// whole region over a short timeout would score a stall as fast
+			if timedOut {
+				reportHostTimeout(hc, d.sector.HostKey, false, uint64(buf.Len()), elapsed)
 			}
 			select {
 			case <-ctx.Done():
@@ -224,12 +237,6 @@ func (s *SDK) downloadSlab(ctx context.Context, hc hostClient, slab slabs.SlabSl
 				hostKey: d.sector.HostKey,
 				elapsed: elapsed,
 			}:
-			}
-			// a host only gets demoted when it hits the shard timeout. reads
-			// cancelled because the chunk completed without them are expected
-			// with overprovisioning and do not count against the host
-			if timeoutCtx.Err() != nil && ctx.Err() == nil {
-				hc.AddFailedRPC(d.sector.HostKey)
 			}
 		})
 	}
@@ -1183,12 +1190,18 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 				wg.Done()
 				<-sema
 			}()
-			pCtx, pCancel := context.WithTimeout(ctx, time.Second)
-			_, err := s.hosts.Prices(pCtx, hk)
-			pCancel()
+			_, timedOut, err := timedAttempt(ctx, time.Second, func(ctx context.Context) error {
+				_, err := s.hosts.Prices(ctx, hk)
+				return err
+			})
 
 			if err == nil {
 				warmed.Add(1)
+			} else if timedOut {
+				// a prices RPC carries no bulk data, so a stalled one says
+				// nothing about throughput. only the failure rate, which
+				// decays, holds the warmup against the host
+				s.hosts.AddFailedRPC(hk)
 			}
 		}(tCtx, hk)
 	}
@@ -1212,12 +1225,52 @@ func sectorRegion(ss slabs.SlabSlice) (offset, length uint64) {
 	return uint64(start), uint64(end - start)
 }
 
-// writeSector uploads a single sector to a host with the given timeout.
-func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+// timeoutReporter is the optional method the production host client uses to
+// demote a host and record the worst-case throughput a deadline implies. It
+// is not part of [HostClient]: adding it there would break existing
+// implementers. A wrapper that does not declare the method is demoted through
+// AddFailedRPC instead, which records no throughput sample.
+type timeoutReporter interface {
+	AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration)
+}
+
+// reportHostTimeout records a deadline the attempt reached on its own. The
+// production client gets a throughput sample; any other HostClient is demoted
+// through AddFailedRPC so existing wrappers keep observing the failure.
+func reportHostTimeout(client hostClient, hostKey types.PublicKey, write bool, n uint64, elapsed time.Duration) {
+	if r, ok := client.(timeoutReporter); ok {
+		r.AddTimedOutRPC(hostKey, write, n, elapsed)
+		return
+	}
+	client.AddFailedRPC(hostKey)
+}
+
+// timedAttempt runs fn against a single host under its own timeout, reporting
+// how long fn took and whether it reached that deadline rather than one
+// inherited from ctx. Only the caller that owns the deadline can tell a host
+// that stalled from a caller that cancelled, so the verdict is taken here,
+// while the attempt context is still the freshest thing that cancelled.
+func timedAttempt(ctx context.Context, timeout time.Duration, fn func(ctx context.Context) error) (time.Duration, bool, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result, err := client.WriteSector(ctx, accountKey, hostKey, data)
-	return result.Root, err
+
+	start := time.Now()
+	err := fn(attemptCtx)
+	elapsed := time.Since(start)
+	timedOut := err != nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	return elapsed, timedOut, err
+}
+
+// writeSector uploads a single sector to a host with the given timeout, also
+// reporting whether the write reached that deadline. See [timedAttempt].
+func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, bool, error) {
+	var root types.Hash256
+	_, timedOut, err := timedAttempt(ctx, timeout, func(ctx context.Context) error {
+		result, err := client.WriteSector(ctx, accountKey, hostKey, data)
+		root = result.Root
+		return err
+	})
+	return root, timedOut, err
 }
 
 // WithRedundancy sets the number of data and parity shards for the upload.
@@ -1301,7 +1354,9 @@ type Option func(*SDK)
 // fn receives the SDK's host client and must return a client that delegates
 // to it. Returning the argument unchanged leaves the transport as it is. The
 // wrapper is applied after the client is built, so it observes writes and
-// does not choose how hosts are reached.
+// does not choose how hosts are reached. A wrapper that also implements
+// AddTimedOutRPC receives deadline samples; otherwise those attempts are
+// reported through AddFailedRPC.
 func WithHostClient(fn func(HostClient) HostClient) Option {
 	return func(s *SDK) {
 		if fn == nil {

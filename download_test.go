@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -73,6 +74,37 @@ func TestDownloadMaxBufferedChunks(t *testing.T) {
 		t.Fatalf("expected capacity 3, got %d", got)
 	} else if got := downloader.limiter.controller.currentLimit(); got != 3 {
 		t.Fatalf("expected initial limit clamped to 3, got %d", got)
+	}
+}
+
+func TestDownloadTimeoutDemotesHost(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(int(proto.SectorSize) * 10)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	// a chunk with no spare hosts needs all ten reads, so the slow host must
+	// use its whole timeout and the chunk fails instead of racing around it
+	chunk := obj.Slabs()[0]
+	chunk.Sectors = chunk.Sectors[:chunk.MinShards]
+	slow := chunk.Sectors[0].HostKey
+	hosts.SetSlowHostKeys([]types.PublicKey{slow}, time.Minute)
+
+	limiter := newInflightLimiter(initialDownloadInflight, minDownloadInflight, 80, int(chunk.MinShards), zaptest.NewLogger(t))
+	if _, err := sdk.downloadSlab(t.Context(), sdk.hosts, chunk, 0, 0, newChangeCounter(0), limiter, 250*time.Millisecond, nil); err == nil {
+		t.Fatal("expected the download to fail")
+	}
+
+	// assert the timed out host was demoted and the responsive ones were not
+	timedOut := hosts.waitTimedOutRPCs(t, 1)
+	if len(timedOut) != 1 {
+		t.Fatal("unexpected demotions", timedOut)
+	} else if timedOut[0].hostKey != slow {
+		t.Fatal("expected the timed out host to be demoted, got", timedOut[0].hostKey)
 	}
 }
 
@@ -354,6 +386,45 @@ func TestDownloadUnusableHosts(t *testing.T) {
 				t.Fatal("data mismatch")
 			}
 		})
+	}
+}
+
+// TestDownloadHostTimeoutDemotes asserts a read that hits the host timeout
+// demotes the host with the throughput it managed, not with the region it was
+// asked for.
+func TestDownloadHostTimeoutDemotes(t *testing.T) {
+	// the redundancy the other tests here use, so twelve sectors have to stall
+	// rather than the default thirty
+	const dataShards, parityShards = 3, 9
+
+	sdk, hosts := newTestSDK(t, dataShards+parityShards, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(int(proto.SectorSize) * dataShards)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(dataShards, parityShards)); err != nil {
+		t.Fatal(err)
+	}
+
+	// every host holding a sector of the slab stalls for far longer than the
+	// host timeout, so the reads hit it instead of failing on their own
+	var slabHosts []types.PublicKey
+	for _, sector := range obj.Slabs()[0].Sectors {
+		slabHosts = append(slabHosts, sector.HostKey)
+	}
+	hosts.SetSlowHostKeys(slabHosts, time.Second)
+
+	if _, err := readAll(sdk.Download(obj, WithDownloadHostTimeout(50*time.Millisecond))); err == nil {
+		t.Fatal("expected the download to fail")
+	}
+
+	// these hosts send nothing before the deadline, so the whole region would
+	// score a stall as fast throughput
+	for _, rpc := range hosts.waitTimedOutRPCs(t, 1) {
+		if !slices.Contains(slabHosts, rpc.hostKey) {
+			t.Fatal("timeout recorded against a host holding no sector", rpc.hostKey)
+		}
+		rpc.assertSample(t, false, 0)
 	}
 }
 
